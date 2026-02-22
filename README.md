@@ -1,134 +1,150 @@
-Manga Toolkit
+# Manga Toolkit
 
-One-command script to organize a long manga series folder.
+`process_manga.py` is a one-command tool that cleans and organizes a manga series folder.
 
-You pass one argument: the path to your longest series folder.
-It shows a full plan, asks for confirmation, then does everything in one pass.
+You give it one folder path (usually your largest or "main" series folder), and it will:
+1. Build a full preview plan.
+2. Ask for your confirmation.
+3. Apply all changes in one run.
 
-⸻
+The goal is to make messy folders consistent, readable, and ready to browse in your library.
 
-What It Does 1. Ensures a series cover exists
-• Uses existing cover.jpg, cover*old.jpg, poster.jpg, etc.
-• If none exist, downloads cover.jpg from:
-• MangaDex
-• AniList
-• Kitsu 2. Scans volume archives
-• Supports: .cbz, .cbr, .cb7, .zip
-• Ignores hidden/macOS junk files 3. Shows a detailed plan
-• Batch folders (SeriesName 1, SeriesName 2, …)
-• Per-file renames
-• Cover actions
-• Volume ranges per batch 4. On confirmation (y) executes everything
-• Splits into batches of 20 volumes
-• Cleans filenames
-• Creates:
-• cover_old.jpg (base image, preserved)
-• cover.jpg (batch number placed dead-center)
-• Archives existing cover.jpg → cover_old*\*.jpg
+## What This Script Does
 
-⸻
+When you run the script, it performs these steps:
 
-Installation
+1. Ensure a cover image exists for the series.
+- If a usable cover already exists (`cover.jpg`, `cover_old.jpg`, `poster.jpg`, etc.), it uses that.
+- If no cover exists, it tries to download one from:
+  - MangaDex
+  - AniList
+  - Kitsu
 
+2. Scan volume archive files.
+- Supported file types: `.cbz`, `.cbr`, `.cb7`, `.zip`
+- Hidden and macOS junk files (like `._*`) are ignored.
+
+3. Show you a detailed plan before making changes.
+- Planned batch folders (`Series Name 1`, `Series Name 2`, ...)
+- Per-file rename actions
+- File move actions
+- Cover image actions
+- Volume ranges per batch
+
+4. Execute only after you confirm with `y` or `yes`.
+- Split volumes into folders of 20 files each
+- Clean and normalize file names
+- Create numbered batch covers
+- Archive existing covers safely instead of overwriting
+
+## Installation
+
+Install required Python packages:
+
+```bash
 pip install pillow requests
+```
 
-⸻
+## Usage
 
-Usage
+Run the script with exactly one argument: the series folder path.
 
-python3 manga_toolkit.py "/path/to/Your Longest Series Folder"
+```bash
+python3 process_manga.py "/path/to/Your Series Folder"
+```
 
 Example:
 
-python3 manga_toolkit.py "/Volumes/Manga/Manga/local/One Piece"
+```bash
+python3 process_manga.py "/Volumes/Manga/Manga/local/One Piece"
+```
 
-⸻
+## Filename Cleanup Rules
 
-Filename Cleanup Rules
+The script normalizes naming to keep files clean and sortable.
 
 Examples:
 
-Naruto (CM) v55.cbz → Naruto v055.cbz
-Naruto v71_1_1.cbz → Naruto v071.cbz
+```text
+Naruto (CM) v55.cbz   -> Naruto v055.cbz
+Naruto v71_1_1.cbz    -> Naruto v071.cbz
+```
 
 Rules:
-• Removes ( … ) segments
-• Normalizes spacing
-• Collapses v71_1_1 → v71
-• Pads volumes to 3 digits (v001, v045, v123)
+- Remove parenthesized segments like `(CM)` or `(Digital)`.
+- Normalize spacing and separators.
+- Collapse variants like `v71_1_1` to `v71`.
+- Zero-pad volume numbers to 3 digits (`v001`, `v045`, `v123`).
 
-⸻
+## Cover Behavior
 
-Cover Behavior
+### Series folder cover
 
-Series Folder
+If the series folder has no usable cover image, the script downloads `cover.jpg` automatically.
 
-If no cover exists:
-• Downloads cover.jpg automatically.
+### Batch folder covers
 
-Batch Folders
+Each batch folder receives:
+- `cover_old.jpg`: preserved base image
+- `cover.jpg`: generated image with the batch number centered
 
-Each batch folder gets:
+If a batch folder already has `cover.jpg`, it is archived instead of replaced directly:
 
-cover_old.jpg ← preserved base image
-cover.jpg ← rendered with batch number
+```text
+cover.jpg -> cover_old_2.jpg
+```
 
-If a batch already contains cover.jpg, it is archived:
+### Batch number placement
 
-cover.jpg → cover_old_2.jpg
+The batch number is rendered to be:
+- Large and readable
+- Scaled to fill the cover well
+- Centered precisely (using glyph bounding-box centering)
 
-Number Placement
+## Output Example
 
-The batch number is:
-• Scaled to fill the image
-• Placed exactly dead-center
-• Centered using glyph bounding box correction (not naive anchor centering)
+Input:
 
-⸻
-
-Output Structure Example
-
-Starting folder:
-
+```text
 One Piece/
-One Piece v001.cbz
-One Piece v002.cbz
-...
+  One Piece v001.cbz
+  One Piece v002.cbz
+  ...
+```
 
-After running:
+After processing:
 
+```text
 One Piece 1/
-One Piece v001.cbz
-...
-One Piece v020.cbz
-cover_old.jpg
-cover.jpg
+  One Piece v001.cbz
+  ...
+  One Piece v020.cbz
+  cover_old.jpg
+  cover.jpg
 
 One Piece 2/
-One Piece v021.cbz
-...
+  One Piece v021.cbz
+  ...
+```
 
-⸻
+## Safety Model
 
-Safety Model
-• Always prints a full plan first.
-• Nothing happens until you confirm.
-• Uses collision-safe renaming.
-• Archives old covers instead of deleting them.
+This tool is designed to avoid destructive behavior:
+- Prints a complete plan before changing anything
+- Does nothing until you confirm
+- Uses collision-safe renaming
+- Archives existing covers instead of deleting them
 
-⸻
+## Requirements
 
-Requirements
-• Python 3.9+
-• Pillow
-• requests
+- Python 3.9+
+- `Pillow`
+- `requests`
 
-⸻
+## Best For
 
-Designed For
-
-Large, messy manga folders that need:
-• Clean naming
-• Logical batch grouping
-• Consistent numbered covers
-• Zero manual intervention
+This script is ideal for large, inconsistent manga folders that need:
+- Cleaner file names
+- Predictable folder grouping
+- Consistent numbered covers
+- A mostly hands-off workflow
