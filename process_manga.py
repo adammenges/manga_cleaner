@@ -8,7 +8,8 @@ You pass exactly ONE argument: the path to a series folder (your "longest series
 
 What it does:
 1) Ensures a series cover exists:
-   - If cover image exists in the series folder, uses it
+   - Prefers first-volume cover extraction (first image in first volume .cbz/.zip)
+   - Falls back to local cover image in series folder
    - Otherwise downloads cover.jpg (MangaDex -> AniList -> Kitsu)
 2) Scans the folder for volume archives (.cbz/.cbr/.cb7/.zip)
 3) Shows a detailed PLAN (batch folders, renames, moves, cover actions)
@@ -28,10 +29,13 @@ Example:
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import shutil
+import subprocess
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Set, Tuple
@@ -49,12 +53,12 @@ VOLUME_EXTS = {".cbz", ".cbr", ".cb7", ".zip"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 COVER_CANDIDATES = [
-    "cover_old.jpg",
     "cover.jpg",
     "cover.jpeg",
     "cover.png",
     "poster.jpg",
     "poster.png",
+    "cover_old.jpg",
 ]
 
 USER_AGENT = "manga-toolkit/1.1 (+https://example.invalid)"
@@ -139,6 +143,13 @@ class CoverResult:
     url: str
 
 
+@dataclass(frozen=True)
+class VolumeCoverResult:
+    volume_file: Path
+    image_entry: str
+    output_file: Path
+
+
 def _http_get_json(url: str, *, params=None, headers=None, timeout=20) -> dict:
     h = {"User-Agent": USER_AGENT, **(headers or {})}
     r = requests.get(url, params=params, headers=h, timeout=timeout)
@@ -171,6 +182,19 @@ def _best_title(attrs: dict) -> str:
     return t.get("en") or next(iter(t.values()), "")
 
 
+def _normalize_title(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def _parse_int_volume(vol: object) -> Optional[int]:
+    if not isinstance(vol, str):
+        return None
+    m = re.fullmatch(r"\s*0*(\d+)(?:\.0+)?\s*", vol)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
 def fetch_cover_mangadex(title: str, *, size: str = "best") -> Optional[CoverResult]:
     base = "https://api.mangadex.org"
 
@@ -180,30 +204,68 @@ def fetch_cover_mangadex(title: str, *, size: str = "best") -> Optional[CoverRes
         return None
 
     title_l = title.strip().lower()
+    title_n = _normalize_title(title_l)
 
     def score(item: dict) -> int:
         attrs = item.get("attributes") or {}
         main = _best_title(attrs).strip().lower()
+        main_n = _normalize_title(main)
         alts = attrs.get("altTitles") or []
         alt_vals = []
+        alt_norms = []
         for a in alts:
             if isinstance(a, dict):
-                alt_vals.extend([str(v).strip().lower() for v in a.values()])
-        if main == title_l or title_l in main:
+                vals = [str(v).strip().lower() for v in a.values()]
+                alt_vals.extend(vals)
+                alt_norms.extend([_normalize_title(v) for v in vals])
+
+        if main_n == title_n:
+            return 6
+        if any(vn == title_n for vn in alt_norms):
+            return 5
+        if main == title_l:
+            return 4
+        if any(v == title_l for v in alt_vals):
             return 3
-        if any(v == title_l or title_l in v for v in alt_vals):
+        if title_l in main:
             return 2
+        if any(title_l in v for v in alt_vals):
+            return 1
         return 1
 
     items.sort(key=score, reverse=True)
     manga = items[0]
     manga_id = manga.get("id")
-    rels = manga.get("relationships") or []
-    cover_rel = next((r for r in rels if r.get("type") == "cover_art"), None)
-    if not manga_id or not cover_rel or not cover_rel.get("id"):
+    if not manga_id:
         return None
 
-    cover_id = cover_rel["id"]
+    # Strictly require the first-volume cover (v1/01/001 etc.) when available.
+    cover_id: Optional[str] = None
+    try:
+        covers_resp = _http_get_json(
+            f"{base}/cover",
+            params={
+                "manga[]": manga_id,
+                "limit": 100,
+                "order[createdAt]": "asc",
+            },
+        )
+        covers = covers_resp.get("data") or []
+        first_volume_covers = []
+        for c in covers:
+            attrs = c.get("attributes") or {}
+            vol_num = _parse_int_volume(attrs.get("volume"))
+            if vol_num == 1:
+                first_volume_covers.append(c)
+        if first_volume_covers:
+            cover_id = first_volume_covers[0].get("id")
+    except Exception:
+        cover_id = None
+
+    if not cover_id:
+        # If MangaDex has no explicit volume-1 cover entry, skip MangaDex result.
+        return None
+
     cover = _http_get_json(f"{base}/cover/{cover_id}")
     file_name = (((cover.get("data") or {}).get("attributes") or {}).get("fileName"))
     if not file_name:
@@ -254,16 +316,89 @@ def fetch_cover_kitsu(title: str) -> Optional[CoverResult]:
     return CoverResult(source="kitsu", url=url)
 
 
-def ensure_series_cover(series_dir: Path, title: str) -> Optional[Path]:
-    """
-    Return a cover image path for the series folder.
-    If none exists locally, attempt to download cover.jpg into the folder.
-    """
-    existing = choose_series_cover(series_dir)
-    if existing is not None:
-        return existing
+def _zip_entry_is_image(entry_name: str) -> bool:
+    p = Path(entry_name)
+    if not p.suffix.lower() in IMAGE_EXTS:
+        return False
+    for part in p.parts:
+        if part == "__MACOSX" or is_hidden_or_macos_junk(part):
+            return False
+    return True
 
-    out_file = series_dir / "cover.jpg"
+
+def _first_image_entry_in_zip(volume_file: Path) -> Optional[str]:
+    with zipfile.ZipFile(volume_file) as zf:
+        entries = [
+            info.filename for info in zf.infolist()
+            if not info.is_dir() and _zip_entry_is_image(info.filename)
+        ]
+        if not entries:
+            return None
+        entries.sort(key=natural_key_name)
+        return entries[0]
+
+
+def find_first_volume_cover(series_dir: Path) -> Tuple[Optional[VolumeCoverResult], Optional[Exception]]:
+    """
+    Mihon-like local logic:
+    choose the first volume and take the first image found in that archive.
+    """
+    try:
+        vols = scan_volumes(series_dir)
+        if not vols:
+            return None, None
+
+        first_vol = vols[0]
+        if first_vol.suffix.lower() not in {".cbz", ".zip"}:
+            return None, RuntimeError(
+                f"first volume is {first_vol.suffix.lower()} (local extraction currently supports .cbz/.zip only)",
+            )
+
+        first_image = _first_image_entry_in_zip(first_vol)
+        if not first_image:
+            return None, RuntimeError(f"no image files found in first volume archive: {first_vol.name}")
+
+        return VolumeCoverResult(
+            volume_file=first_vol,
+            image_entry=first_image,
+            output_file=series_dir / "cover.jpg",
+        ), None
+    except Exception as e:
+        return None, e
+
+
+def write_volume_cover(result: VolumeCoverResult) -> Path:
+    result.output_file.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(result.volume_file) as zf:
+        with zf.open(result.image_entry) as src:
+            with Image.open(src) as im:
+                im.convert("RGB").save(result.output_file, format="JPEG", quality=95, subsampling=0)
+    return result.output_file
+
+
+def ensure_cover_jpg(series_dir: Path, selected_cover: Path) -> Path:
+    cover_jpg = series_dir / "cover.jpg"
+    if selected_cover.resolve() == cover_jpg.resolve():
+        return cover_jpg
+
+    with Image.open(selected_cover) as im:
+        im.convert("RGB").save(cover_jpg, format="JPEG", quality=95, subsampling=0)
+    return cover_jpg
+
+
+def open_image(path: Path) -> None:
+    # Use OS default viewer
+    if sys.platform == "darwin":
+        cmd = ["open", str(path)]
+    elif sys.platform.startswith("win"):
+        cmd = ["cmd", "/c", "start", "", str(path)]
+    else:
+        cmd = ["xdg-open", str(path)]
+
+    subprocess.run(cmd, check=True)
+
+
+def find_remote_cover(title: str) -> Tuple[Optional[CoverResult], Optional[Exception]]:
     fetchers = [
         ("mangadex", lambda: fetch_cover_mangadex(title, size="best")),
         ("anilist", lambda: fetch_cover_anilist(title)),
@@ -274,14 +409,47 @@ def ensure_series_cover(series_dir: Path, title: str) -> Optional[Path]:
     for _, fn in fetchers:
         try:
             res = fn()
-            if not res:
-                continue
+            if res:
+                return res, None
+        except Exception as e:
+            last_err = e
+            continue
+    return None, last_err
+
+
+def ensure_series_cover(series_dir: Path, title: str) -> Optional[Path]:
+    """
+    Return a cover image path for the series folder.
+    If none exists locally, attempt to download cover.jpg into the folder.
+    """
+    first_vol_cover, first_vol_err = find_first_volume_cover(series_dir)
+    if first_vol_cover is not None:
+        try:
+            out = write_volume_cover(first_vol_cover)
+            print(
+                f"[COVER] Extracted series cover from first volume: {out} "
+                f"(source={first_vol_cover.volume_file.name}:{first_vol_cover.image_entry})",
+            )
+            return out
+        except Exception as e:
+            first_vol_err = e
+
+    existing = choose_series_cover(series_dir)
+    if existing is not None:
+        return existing
+
+    out_file = series_dir / "cover.jpg"
+    res, last_err = find_remote_cover(title)
+    if res:
+        try:
             _download_file(res.url, out_file)
             print(f"[COVER] Downloaded series cover: {out_file} (source={res.source})")
             return out_file
         except Exception as e:
             last_err = e
-            continue
+
+    if first_vol_err:
+        print(f"[WARN] Failed to extract first-volume cover. Last error: {first_vol_err}", file=sys.stderr)
 
     if last_err:
         print(f"[WARN] Failed to download series cover. Last error: {last_err}", file=sys.stderr)
@@ -547,14 +715,34 @@ def execute(plan: Sequence[BatchPlan], series_cover: Optional[Path]) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
-    if len(argv) != 1:
-        print("Usage: python3 process_manga.py \"/path/to/Series Folder\"", file=sys.stderr)
-        return 2
+    parser = argparse.ArgumentParser(description="Clean and batch manga files with numbered covers.")
+    parser.add_argument("series_dir", help="Path to the series folder")
+    parser.add_argument(
+        "--show-cover",
+        action="store_true",
+        help="Resolve the selected cover, ensure cover.jpg exists, open it, then exit.",
+    )
+    args = parser.parse_args(argv)
 
-    series_dir = Path(argv[0]).expanduser().resolve()
+    series_dir = Path(args.series_dir).expanduser().resolve()
     if not series_dir.is_dir():
         print(f"[ERROR] Not a directory: {series_dir}", file=sys.stderr)
         return 2
+
+    if args.show_cover:
+        series_cover = ensure_series_cover(series_dir, title=series_dir.name)
+        if series_cover is None:
+            print("[COVER-CHECK] No cover found from local files or remote providers.", file=sys.stderr)
+            return 1
+
+        try:
+            cover_jpg = ensure_cover_jpg(series_dir, series_cover)
+            print(f"[COVER-CHECK] Opening: {cover_jpg}")
+            open_image(cover_jpg)
+            return 0
+        except Exception as e:
+            print(f"[COVER-CHECK] Failed to open cover image: {e}", file=sys.stderr)
+            return 1
 
     # Ensure series cover exists (download if missing)
     series_cover = ensure_series_cover(series_dir, title=series_dir.name)
