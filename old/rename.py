@@ -21,17 +21,14 @@ def clean_filename(name):
 
 def get_unique_path(path):
     base, ext = os.path.splitext(path)
-    counter = 1
-    new_path = path
+    counter = 2
+    new_path = f"{base}_{counter}{ext}"
     while os.path.exists(new_path):
-        new_path = f"{base}_{counter}{ext}"
         counter += 1
+        new_path = f"{base}_{counter}{ext}"
     return new_path
 
 for root, dirs, files in os.walk(BASE_DIR):
-    # if root == BASE_DIR:
-    #     continue
-
     for file in files:
         # Skip macOS junk files and hidden files
         if file.startswith("._") or file.startswith("."):
@@ -48,8 +45,12 @@ for root, dirs, files in os.walk(BASE_DIR):
             continue
 
         new_name = clean_filename(file)
-        new_path = os.path.join(BASE_DIR, new_name)
-        new_path = get_unique_path(new_path)
+        if new_name == file:
+            continue
+
+        new_path = os.path.join(root, new_name)
+        if os.path.exists(new_path):
+            new_path = get_unique_path(new_path)
 
         shutil.move(old_path, new_path)
         print(f"Moved: {new_path}")

@@ -34,7 +34,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Set, Tuple
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -91,6 +91,23 @@ def unique_path(dest_dir: Path, filename: str) -> Path:
     while True:
         candidate = dest_dir / f"{stem} ({i}){ext}"
         if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def unique_path_reserved(dest_dir: Path, filename: str, reserved: Set[str]) -> Path:
+    candidate = dest_dir / filename
+    if not candidate.exists() and candidate.name not in reserved:
+        reserved.add(candidate.name)
+        return candidate
+
+    stem = Path(filename).stem
+    ext = Path(filename).suffix
+    i = 2
+    while True:
+        candidate = dest_dir / f"{stem} ({i}){ext}"
+        if not candidate.exists() and candidate.name not in reserved:
+            reserved.add(candidate.name)
             return candidate
         i += 1
 
@@ -453,9 +470,10 @@ def build_plan(series_dir: Path, series_cover: Optional[Path]) -> List[BatchPlan
     for idx, group in enumerate(groups, start=1):
         batch_dir = dest_parent / f"{series_dir.name} {idx}"
         moves: List[FileMove] = []
+        reserved_names: Set[str] = set()
         for p in group:
             cleaned = clean_volume_filename(p.name, pad_to_3=True)
-            dst = unique_path(batch_dir, cleaned)
+            dst = unique_path_reserved(batch_dir, cleaned, reserved_names)
             moves.append(FileMove(src=p, dst=dst, dst_name=dst.name))
 
         plan.append(
