@@ -722,7 +722,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Resolve the selected cover, ensure cover.jpg exists, open it, then exit.",
     )
+    parser.add_argument(
+        "--print-cover-path",
+        action="store_true",
+        help="Resolve the selected cover, ensure cover.jpg exists, print the path, then exit.",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Execute all planned actions without asking for confirmation.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the full plan and exit without moving files or writing covers.",
+    )
     args = parser.parse_args(argv)
+    if args.show_cover and (args.print_cover_path or args.yes or args.dry_run):
+        parser.error("--show-cover cannot be combined with --print-cover-path, --yes, or --dry-run")
+    if args.print_cover_path and (args.show_cover or args.yes or args.dry_run):
+        parser.error("--print-cover-path cannot be combined with --show-cover, --yes, or --dry-run")
 
     series_dir = Path(args.series_dir).expanduser().resolve()
     if not series_dir.is_dir():
@@ -744,6 +764,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"[COVER-CHECK] Failed to open cover image: {e}", file=sys.stderr)
             return 1
 
+    if args.print_cover_path:
+        series_cover = ensure_series_cover(series_dir, title=series_dir.name)
+        if series_cover is None:
+            print("[COVER-CHECK] No cover found from local files or remote providers.", file=sys.stderr)
+            return 1
+
+        try:
+            cover_jpg = ensure_cover_jpg(series_dir, series_cover)
+            print(str(cover_jpg))
+            return 0
+        except Exception as e:
+            print(f"[COVER-CHECK] Failed to resolve cover image: {e}", file=sys.stderr)
+            return 1
+
     # Ensure series cover exists (download if missing)
     series_cover = ensure_series_cover(series_dir, title=series_dir.name)
 
@@ -754,6 +788,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     print_plan(series_dir, plan, series_cover)
+
+    if args.dry_run:
+        print("[DRY-RUN] Plan printed only. No changes were made.")
+        return 0
+
+    if args.yes:
+        execute(plan, series_cover)
+        return 0
 
     if not confirm("\nProceed and execute everything now? [y/N]: "):
         print("[SKIP] Aborted by user.")

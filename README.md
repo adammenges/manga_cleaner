@@ -76,6 +76,50 @@ Example:
 python3 process_manga.py "/Volumes/Manga/Manga/local/One Piece"
 ```
 
+Non-interactive flags:
+
+```bash
+# Print plan only (no file changes)
+python3 process_manga.py --dry-run "/path/to/Your Series Folder"
+
+# Execute without the y/yes prompt
+python3 process_manga.py --yes "/path/to/Your Series Folder"
+```
+
+## Basic UI (macOS-friendly)
+
+Launch the browser UI:
+
+```bash
+python3 process_manga_ui.py
+```
+
+Optional: pass a starting folder path so the UI is pre-filled.
+
+```bash
+python3 process_manga_ui.py "/path/to/Your Series Folder"
+```
+
+The UI opens in your browser and provides:
+
+- `Browse macOS`: native folder picker (`osascript`).
+- `Show Cover`: resolves the series cover and displays it directly in the UI.
+- `Show Plan`: runs `--dry-run` and prints the full plan in the in-app terminal panel.
+- `Commit + Process`: runs `--yes` and streams live output in the same terminal panel.
+
+Useful flags:
+
+```bash
+# Run UI server without opening browser automatically
+python3 process_manga_ui.py --no-open
+
+# Change port
+python3 process_manga_ui.py --port 8877
+
+# Use a specific Python interpreter for worker actions
+python3 process_manga_ui.py --python-bin /usr/bin/python3
+```
+
 ## Filename Cleanup Rules
 
 The script normalizes naming to keep files clean and sortable.
