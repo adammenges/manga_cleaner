@@ -3,8 +3,8 @@ use std::process;
 use anyhow::{bail, Result};
 use clap::Parser;
 use manga_cleaner::{
-    build_plan, ensure_cover_jpg, ensure_series_cover, execute, format_plan, open_image, prompt_confirm,
-    resolve_series_dir,
+    build_plan, ensure_cover_jpg, ensure_series_cover, execute, format_plan, open_image,
+    prompt_confirm, resolve_series_dir,
 };
 
 #[derive(Debug, Parser)]
@@ -14,13 +14,23 @@ struct Args {
     #[arg(help = "Path to the series folder")]
     series_dir: String,
 
-    #[arg(long, help = "Resolve selected cover, ensure cover.jpg exists, open it, then exit.")]
+    #[arg(
+        long,
+        help = "Resolve selected cover, ensure cover.jpg exists, open it, then exit."
+    )]
     show_cover: bool,
 
-    #[arg(long, help = "Resolve selected cover, ensure cover.jpg exists, print path, then exit.")]
+    #[arg(
+        long,
+        help = "Resolve selected cover, ensure cover.jpg exists, print path, then exit."
+    )]
     print_cover_path: bool,
 
-    #[arg(short = 'y', long, help = "Execute all planned actions without confirmation.")]
+    #[arg(
+        short = 'y',
+        long,
+        help = "Execute all planned actions without confirmation."
+    )]
     yes: bool,
 
     #[arg(long, help = "Print full plan and exit without changing files.")]
@@ -71,7 +81,10 @@ fn run() -> Result<i32> {
     let series_cover = ensure_series_cover(&series_dir, &series_title, &mut log)?;
 
     let plan = build_plan(&series_dir, series_cover.as_deref())?;
-    print!("{}", format_plan(&series_dir, &plan, series_cover.as_deref()));
+    print!(
+        "{}",
+        format_plan(&series_dir, &plan, series_cover.as_deref())
+    );
 
     if args.dry_run {
         println!("[DRY-RUN] Plan printed only. No changes were made.");

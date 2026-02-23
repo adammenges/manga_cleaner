@@ -129,7 +129,8 @@ fn natural_sort_strings(values: &mut [String]) {
 }
 
 pub fn ensure_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("failed to create directory: {}", path.display()))
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create directory: {}", path.display()))
 }
 
 pub fn unique_path(dest_dir: &Path, filename: &str) -> PathBuf {
@@ -158,7 +159,11 @@ pub fn unique_path(dest_dir: &Path, filename: &str) -> PathBuf {
     }
 }
 
-pub fn unique_path_reserved(dest_dir: &Path, filename: &str, reserved: &mut HashSet<String>) -> PathBuf {
+pub fn unique_path_reserved(
+    dest_dir: &Path,
+    filename: &str,
+    reserved: &mut HashSet<String>,
+) -> PathBuf {
     let candidate = dest_dir.join(filename);
     if !candidate.exists() && !reserved.contains(filename) {
         reserved.insert(filename.to_string());
@@ -362,7 +367,10 @@ pub fn format_plan(series_dir: &Path, plan: &[BatchPlan], series_cover: Option<&
     out.push_str(&format!("[PLAN] Batch size: {FILES_PER_FOLDER}\n"));
 
     if let Some(cover) = series_cover {
-        out.push_str(&format!("[PLAN] Series cover source: {}\n", cover.display()));
+        out.push_str(&format!(
+            "[PLAN] Series cover source: {}\n",
+            cover.display()
+        ));
         out.push_str("[PLAN] Each batch will have:\n");
         out.push_str("       - cover_old.jpg (copied once from series cover, preserved)\n");
         out.push_str("       - cover.jpg (rendered with batch number DEAD-CENTER)\n");
@@ -381,10 +389,7 @@ pub fn format_plan(series_dir: &Path, plan: &[BatchPlan], series_cover: Option<&
         out.push('\n');
         out.push_str(&format!(
             "{} {}  (volumes {}-{})\n",
-            series_name,
-            batch.batch_index,
-            start_idx,
-            end_idx
+            series_name, batch.batch_index, start_idx, end_idx
         ));
         out.push_str(&format!("  [DIR] {}\n", batch.batch_dir.display()));
         if series_cover.is_some() {
@@ -432,11 +437,16 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
                         dst.display()
                     )
                 })?;
-                fs::remove_file(src).with_context(|| format!("failed to remove source file: {}", src.display()))?;
+                fs::remove_file(src)
+                    .with_context(|| format!("failed to remove source file: {}", src.display()))?;
                 Ok(())
             } else {
                 Err(err).with_context(|| {
-                    format!("failed to move file from {} to {}", src.display(), dst.display())
+                    format!(
+                        "failed to move file from {} to {}",
+                        src.display(),
+                        dst.display()
+                    )
                 })
             }
         }
@@ -624,7 +634,8 @@ pub fn fetch_cover_mangadex(title: &str, size: &str) -> Result<Option<CoverResul
                 for cover in covers {
                     let attrs = cover.get("attributes").unwrap_or(&Value::Null);
                     if parse_int_volume(attrs.get("volume").unwrap_or(&Value::Null)) == Some(1) {
-                        first_volume_cover = cover.get("id").and_then(Value::as_str).map(str::to_string);
+                        first_volume_cover =
+                            cover.get("id").and_then(Value::as_str).map(str::to_string);
                         if first_volume_cover.is_some() {
                             break;
                         }
@@ -725,9 +736,21 @@ pub fn fetch_cover_kitsu(title: &str) -> Result<Option<CoverResult>> {
     let url = first
         .pointer("/attributes/coverImage/original")
         .and_then(Value::as_str)
-        .or_else(|| first.pointer("/attributes/coverImage/large").and_then(Value::as_str))
-        .or_else(|| first.pointer("/attributes/coverImage/small").and_then(Value::as_str))
-        .or_else(|| first.pointer("/attributes/coverImage/tiny").and_then(Value::as_str));
+        .or_else(|| {
+            first
+                .pointer("/attributes/coverImage/large")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            first
+                .pointer("/attributes/coverImage/small")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            first
+                .pointer("/attributes/coverImage/tiny")
+                .and_then(Value::as_str)
+        });
 
     let Some(url) = url else {
         return Ok(None);
@@ -825,8 +848,12 @@ fn find_first_volume_cover_inner(series_dir: &Path) -> Result<Option<VolumeCover
         );
     }
 
-    let first_image = first_image_entry_in_zip(&first_volume)?
-        .ok_or_else(|| anyhow!("no image files found in first volume archive: {}", file_name_text(&first_volume)))?;
+    let first_image = first_image_entry_in_zip(&first_volume)?.ok_or_else(|| {
+        anyhow!(
+            "no image files found in first volume archive: {}",
+            file_name_text(&first_volume)
+        )
+    })?;
 
     Ok(Some(VolumeCoverResult {
         volume_file: first_volume,
@@ -887,7 +914,9 @@ pub fn ensure_cover_jpg(series_dir: &Path, selected_cover: &Path) -> Result<Path
     let selected_resolved = selected_cover
         .canonicalize()
         .unwrap_or_else(|_| selected_cover.to_path_buf());
-    let cover_resolved = cover_jpg.canonicalize().unwrap_or_else(|_| cover_jpg.clone());
+    let cover_resolved = cover_jpg
+        .canonicalize()
+        .unwrap_or_else(|_| cover_jpg.clone());
 
     if selected_resolved == cover_resolved {
         return Ok(cover_jpg);
@@ -1022,7 +1051,9 @@ pub fn ensure_series_cover(
     }
 
     if let Some(err) = last_err {
-        log(format!("[WARN] Failed to download series cover. Last error: {err}"));
+        log(format!(
+            "[WARN] Failed to download series cover. Last error: {err}"
+        ));
     } else {
         log("[WARN] Failed to download series cover (no results).".to_string());
     }
@@ -1118,7 +1149,12 @@ fn alpha_bbox(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
     Some((min_x, min_y, max_x, max_y))
 }
 
-fn draw_dead_center_text(base_image: &DynamicImage, text: &str, opacity: u8, scale: f32) -> Result<DynamicImage> {
+fn draw_dead_center_text(
+    base_image: &DynamicImage,
+    text: &str,
+    opacity: u8,
+    scale: f32,
+) -> Result<DynamicImage> {
     let mut rgba = base_image.to_rgba8();
     let (w, h) = rgba.dimensions();
 
@@ -1160,7 +1196,7 @@ fn draw_dead_center_text(base_image: &DynamicImage, text: &str, opacity: u8, sca
         }
         x += dx;
         y += dy;
-    };
+    }
 
     draw_text_mut(
         &mut rgba,
@@ -1226,13 +1262,21 @@ pub fn write_numbered_cover(batch_dir: &Path, number: usize, series_cover: &Path
     Ok(())
 }
 
-pub fn execute(plan: &[BatchPlan], series_cover: Option<&Path>, log: &mut dyn FnMut(String)) -> Result<()> {
+pub fn execute(
+    plan: &[BatchPlan],
+    series_cover: Option<&Path>,
+    log: &mut dyn FnMut(String),
+) -> Result<()> {
     for batch in plan {
         ensure_dir(&batch.batch_dir)?;
 
         log(String::new());
         log("-".repeat(98));
-        log(format!("[DO] Batch {}: {}", batch.batch_index, file_name_text(&batch.batch_dir)));
+        log(format!(
+            "[DO] Batch {}: {}",
+            batch.batch_index,
+            file_name_text(&batch.batch_dir)
+        ));
         log("-".repeat(98));
 
         for (i, mv) in batch.moves.iter().enumerate() {
@@ -1259,7 +1303,11 @@ pub fn execute(plan: &[BatchPlan], series_cover: Option<&Path>, log: &mut dyn Fn
     Ok(())
 }
 
-pub fn run_action(action: UiAction, series_dir: &Path, log: &mut dyn FnMut(String)) -> Result<ActionOutput> {
+pub fn run_action(
+    action: UiAction,
+    series_dir: &Path,
+    log: &mut dyn FnMut(String),
+) -> Result<ActionOutput> {
     if !series_dir.is_dir() {
         bail!("Not a directory: {}", series_dir.display());
     }
@@ -1392,7 +1440,9 @@ mod tests {
 
     #[test]
     fn centered_text_on_example_cover() {
-        let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("example_cover").join("cover.jpg");
+        let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("example_cover")
+            .join("cover.jpg");
         let base = ImageReader::open(&example)
             .expect("open example cover")
             .decode()
