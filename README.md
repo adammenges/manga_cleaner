@@ -1,128 +1,91 @@
-# Manga Toolkit
+# Manga Cleaner
 
-`process_manga.py` is a one-command tool that cleans and organizes a manga series folder.
+`manga_cleaner_native` is now the primary app for this project: a fully native Rust desktop app built with Iced.
 
-You give it one folder path (usually your largest or "main" series folder), and it will:
+## Primary Usage (Rust + Cargo)
 
-1. Build a full preview plan.
-2. Ask for your confirmation.
-3. Apply all changes in one run.
-
-The goal is to make messy folders consistent, readable, and ready to browse in your library.
-
-## What This Script Does
-
-When you run the script, it performs these steps:
-
-1. Ensure a cover image exists for the series.
-
-- It first tries Mihon-style local cover extraction:
-  - first volume file in natural order
-  - first image inside that volume (currently supported for `.cbz` / `.zip`)
-- If that is unavailable, it uses a local cover file (`cover.jpg`, `cover_old.jpg`, `poster.jpg`, etc.).
-- If no local cover can be used, it tries to download one from:
-  - MangaDex
-  - AniList
-  - Kitsu
-  - MangaDex is preferred first and now strictly targets volume 1 cover entries.
-
-2. Scan volume archive files.
-
-- Supported file types: `.cbz`, `.cbr`, `.cb7`, `.zip`
-- Hidden and macOS junk files (like `._*`) are ignored.
-
-3. Show you a detailed plan before making changes.
-
-- Planned batch folders (`Series Name 1`, `Series Name 2`, ...)
-- Per-file rename actions
-- File move actions
-- Cover image actions
-- Volume ranges per batch
-
-4. Execute only after you confirm with `y` or `yes`.
-
-- Split volumes into folders of 20 files each
-- Clean and normalize file names
-- Create numbered batch covers
-- Archive existing covers safely instead of overwriting
-
-## Installation
-
-Install required Python packages:
+### 1. Install Rust (macOS)
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+curl https://sh.rustup.rs -sSf | sh
+source "$HOME/.cargo/env"
 ```
 
-## Usage
-
-Run the script with exactly one argument: the series folder path.
+### 2. Build the app
 
 ```bash
-python3 process_manga.py "/path/to/Your Series Folder"
+cargo build --release
 ```
 
-Preview and open the selected cover image:
+### 2b. Build a native macOS `.app` bundle with icon
+
+The project includes scripts that turn `icon/base.png` into a macOS `.icns` and package a Finder-native app bundle:
 
 ```bash
-python3 process_manga.py --show-cover "/path/to/Your Series Folder"
+./scripts/macos_build_app.sh
 ```
 
-Example:
+This creates:
+
+```text
+dist/Manga Cleaner Native.app
+```
+
+Launch it like a normal app:
 
 ```bash
-python3 process_manga.py "/Volumes/Manga/Manga/local/One Piece"
+open "dist/Manga Cleaner Native.app"
 ```
 
-Non-interactive flags:
+### 3. Run the native desktop app (recommended)
 
 ```bash
-# Print plan only (no file changes)
-python3 process_manga.py --dry-run "/path/to/Your Series Folder"
-
-# Execute without the y/yes prompt
-python3 process_manga.py --yes "/path/to/Your Series Folder"
+cargo run --release --bin manga_cleaner_native
 ```
 
-## Basic UI (macOS-friendly)
-
-Launch the browser UI:
+Optional: start with a prefilled series folder path.
 
 ```bash
-python3 process_manga_ui.py
+cargo run --release --bin manga_cleaner_native -- "/path/to/Your Series Folder"
 ```
 
-Optional: pass a starting folder path so the UI is pre-filled.
+### 4. Run the Rust CLI
 
 ```bash
-python3 process_manga_ui.py "/path/to/Your Series Folder"
+cargo run --release --bin process_manga_rs -- "/path/to/Your Series Folder"
 ```
 
-The UI opens in your browser and provides:
-
-- `Browse macOS`: native folder picker (`osascript`).
-- `Show Cover`: resolves the series cover and displays it directly in the UI.
-- `Show Plan`: runs `--dry-run` and prints the full plan in the in-app terminal panel.
-- `Commit + Process`: runs `--yes` and streams live output in the same terminal panel.
-
-Useful flags:
+Common CLI options:
 
 ```bash
-# Run UI server without opening browser automatically
-python3 process_manga_ui.py --no-open
+# Preview plan only (no file changes)
+cargo run --release --bin process_manga_rs -- --dry-run "/path/to/Your Series Folder"
 
-# Change port
-python3 process_manga_ui.py --port 8877
+# Execute without prompt
+cargo run --release --bin process_manga_rs -- --yes "/path/to/Your Series Folder"
 
-# Use a specific Python interpreter for worker actions
-python3 process_manga_ui.py --python-bin /usr/bin/python3
+# Resolve + open selected cover
+cargo run --release --bin process_manga_rs -- --show-cover "/path/to/Your Series Folder"
 ```
 
-## Filename Cleanup Rules
+## What the App Does
 
-The script normalizes naming to keep files clean and sortable.
+Given one series folder, Manga Cleaner will:
+
+1. Resolve a series cover image.
+2. Scan volume archives (`.cbz`, `.cbr`, `.cb7`, `.zip`).
+3. Build and show a full execution plan.
+4. Process volumes into batches of 20.
+5. Normalize filenames.
+6. Generate numbered batch covers.
+
+### Cover resolution order
+
+1. First image in first volume archive (`.cbz`/`.zip`) if available.
+2. Existing local cover files in the series folder.
+3. Remote fallback (`MangaDex -> AniList -> Kitsu`).
+
+### Filename normalization
 
 Examples:
 
@@ -133,41 +96,18 @@ Naruto v71_1_1.cbz    -> Naruto v071.cbz
 
 Rules:
 
-- Remove parenthesized segments like `(CM)` or `(Digital)`.
-- Normalize spacing and separators.
-- Collapse variants like `v71_1_1` to `v71`.
+- Remove parenthesized suffixes like `(CM)` or `(Digital)`.
+- Collapse patterns like `v71_1_1` to `v71`.
 - Zero-pad volume numbers to 3 digits (`v001`, `v045`, `v123`).
 
-## Cover Behavior
+### Batch cover behavior
 
-### Series folder cover
+Each output folder receives:
 
-The script prioritizes cover selection in this order:
+- `cover_old.jpg` (preserved base)
+- `cover.jpg` (generated number overlay)
 
-1. First volume archive cover (first image from first volume file, Mihon-style).
-2. Existing local cover files in the series folder.
-3. Downloaded `cover.jpg` from MangaDex/AniList/Kitsu fallback.
-
-### Batch folder covers
-
-Each batch folder receives:
-
-- `cover_old.jpg`: preserved base image
-- `cover.jpg`: generated image with the batch number centered
-
-If a batch folder already has `cover.jpg`, it is archived instead of replaced directly:
-
-```text
-cover.jpg -> cover_old_2.jpg
-```
-
-### Batch number placement
-
-The batch number is rendered to be:
-
-- Large and readable
-- Scaled to fill the cover well
-- Centered precisely (using glyph bounding-box centering)
+If `cover.jpg` already exists, it is archived first (for example `cover_old_2.jpg`).
 
 ## Output Example
 
@@ -197,24 +137,47 @@ One Piece 2/
 
 ## Safety Model
 
-This tool is designed to avoid destructive behavior:
+- Prints a complete plan before changing files.
+- Supports dry-run mode.
+- Uses collision-safe naming.
+- Archives existing covers instead of deleting.
 
-- Prints a complete plan before changing anything
-- Does nothing until you confirm
-- Uses collision-safe renaming
-- Archives existing covers instead of deleting them
+---
 
-## Requirements
+## Legacy Python Workflow (Old)
 
-- Python 3.9+
-- `Pillow`
-- `requests`
+The Python tools are kept for compatibility, but are no longer the primary path.
 
-## Best For
+### Install Python dependencies
 
-This script is ideal for large, inconsistent manga folders that need:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-- Cleaner file names
-- Predictable folder grouping
-- Consistent numbered covers
-- A mostly hands-off workflow
+### Old CLI
+
+```bash
+python3 process_manga.py "/path/to/Your Series Folder"
+```
+
+Useful options:
+
+```bash
+python3 process_manga.py --dry-run "/path/to/Your Series Folder"
+python3 process_manga.py --yes "/path/to/Your Series Folder"
+python3 process_manga.py --show-cover "/path/to/Your Series Folder"
+```
+
+### Old browser UI
+
+```bash
+python3 process_manga_ui.py
+```
+
+Optional with prefilled folder:
+
+```bash
+python3 process_manga_ui.py "/path/to/Your Series Folder"
+```
