@@ -1631,18 +1631,27 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
 fn main() -> iced::Result {
     let args = UiArgs::parse();
 
-    let mut window_settings = iced::window::Settings {
+    #[cfg(target_os = "macos")]
+    let window_settings = {
+        let mut settings = iced::window::Settings {
+            size: Size::new(1280.0, 860.0),
+            min_size: Some(Size::new(1080.0, 760.0)),
+            ..iced::window::Settings::default()
+        };
+
+        settings.platform_specific.title_hidden = true;
+        settings.platform_specific.titlebar_transparent = true;
+        settings.platform_specific.fullsize_content_view = true;
+
+        settings
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let window_settings = iced::window::Settings {
         size: Size::new(1280.0, 860.0),
         min_size: Some(Size::new(1080.0, 760.0)),
         ..iced::window::Settings::default()
     };
-
-    #[cfg(target_os = "macos")]
-    {
-        window_settings.platform_specific.title_hidden = true;
-        window_settings.platform_specific.titlebar_transparent = true;
-        window_settings.platform_specific.fullsize_content_view = true;
-    }
 
     MangaCleanerApp::run(Settings {
         flags: AppFlags {
