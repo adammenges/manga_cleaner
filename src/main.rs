@@ -1317,7 +1317,7 @@ impl Application for MangaCleanerApp {
 
         let content = column![topbar, source_card, flow_card, workspace_row, activity_card]
             .spacing(12)
-            .padding([18, 20])
+            .padding(top_content_padding())
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -1506,6 +1506,15 @@ fn app_surface(_theme: &Theme) -> iced::widget::container::Appearance {
     }
 }
 
+fn top_content_padding() -> [u16; 4] {
+    if cfg!(target_os = "macos") {
+        // Leave room for macOS traffic-light controls when content extends into the titlebar.
+        [42, 20, 18, 20]
+    } else {
+        [18, 20, 18, 20]
+    }
+}
+
 fn card_surface(_theme: &Theme) -> iced::widget::container::Appearance {
     iced::widget::container::Appearance {
         text_color: None,
@@ -1622,15 +1631,24 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
 fn main() -> iced::Result {
     let args = UiArgs::parse();
 
+    let mut window_settings = iced::window::Settings {
+        size: Size::new(1280.0, 860.0),
+        min_size: Some(Size::new(1080.0, 760.0)),
+        ..iced::window::Settings::default()
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        window_settings.platform_specific.title_hidden = true;
+        window_settings.platform_specific.titlebar_transparent = true;
+        window_settings.platform_specific.fullsize_content_view = true;
+    }
+
     MangaCleanerApp::run(Settings {
         flags: AppFlags {
             initial_series_dir: args.series_dir.unwrap_or_default(),
         },
-        window: iced::window::Settings {
-            size: Size::new(1280.0, 860.0),
-            min_size: Some(Size::new(1080.0, 760.0)),
-            ..iced::window::Settings::default()
-        },
+        window: window_settings,
         default_font: FONT_TEXT,
         antialiasing: true,
         ..Settings::default()
