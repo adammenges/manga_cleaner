@@ -17,6 +17,26 @@ source "$HOME/.cargo/env"
 cargo build --release
 ```
 
+### 2b. Build a native macOS `.app` bundle with icon
+
+The project includes scripts that turn `icon/base.png` into a macOS `.icns` and package a Finder-native app bundle:
+
+```bash
+./scripts/macos_build_app.sh
+```
+
+This creates:
+
+```text
+dist/Manga Cleaner Native.app
+```
+
+Launch it like a normal app:
+
+```bash
+open "dist/Manga Cleaner Native.app"
+```
+
 ### 3. Run the native desktop app (recommended)
 
 ```bash
