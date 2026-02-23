@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
     time::Duration,
@@ -10,15 +10,17 @@ use iced::{
     executor,
     theme::{self, Theme},
     time,
-    widget::scrollable::{self, Id as ScrollableId, RelativeOffset},
     widget::{
-        button, column, container, horizontal_space, image, row, scrollable as make_scrollable,
-        text,
+        button, column, container, horizontal_rule, horizontal_space, image, progress_bar, row,
+        scrollable, text,
     },
     Alignment, Application, Background, Border, Color, Command, Element, Font, Length, Settings,
     Shadow, Size, Subscription, Vector,
 };
-use manga_cleaner::{resolve_series_dir, run_action, ActionOutput, UiAction};
+use manga_cleaner::{
+    build_plan, ensure_cover_jpg, ensure_series_cover, execute, resolve_series_dir, BatchPlan,
+    FILES_PER_FOLDER,
+};
 use rfd::FileDialog;
 
 const FONT_TEXT: Font = Font::with_name("SF Pro Text");
@@ -26,12 +28,16 @@ const FONT_DISPLAY: Font = Font::with_name("SF Pro Display");
 const FONT_SYMBOLS: Font = Font::with_name("SF Pro");
 
 const ICON_FOLDER: &str = "􀈕";
-const ICON_STATUS: &str = "􀐫";
+const ICON_REFRESH: &str = "􀣓";
+const ICON_FLOW: &str = "􀐫";
 const ICON_COVER: &str = "􀏅";
-const ICON_PLAN: &str = "􀙔";
 const ICON_PROCESS: &str = "􀒓";
-const ICON_LOG: &str = "􀐌";
-const ICON_CLEAR: &str = "􀅈";
+const ICON_ACTIVITY: &str = "􀐌";
+const ICON_WAITING: &str = "􀆈";
+const ICON_RUNNING: &str = "􀐰";
+const ICON_DONE: &str = "􀆅";
+const ICON_ERROR: &str = "􀅚";
+const ICON_ARROW: &str = "􀄯";
 
 #[derive(Debug, Parser)]
 #[command(name = "manga_cleaner_native")]
@@ -46,69 +52,114 @@ struct AppFlags {
     initial_series_dir: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageState {
+    Pending,
+    Running,
+    Complete,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ActivityTone {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct ActivityItem {
+    tone: ActivityTone,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
+struct AnalysisSnapshot {
+    resolved_dir: PathBuf,
+    cover_path: Option<PathBuf>,
+    plan: Vec<BatchPlan>,
+    volume_count: usize,
+    rename_count: usize,
+}
+
+impl AnalysisSnapshot {
+    fn batch_count(&self) -> usize {
+        self.plan.len()
+    }
+
+    fn cover_batch_count(&self) -> usize {
+        self.plan
+            .iter()
+            .filter(|batch| batch.will_make_cover)
+            .count()
+    }
+}
+
 #[derive(Debug)]
 enum WorkerEvent {
-    Log(String),
-    Done(Result<ActionOutput, String>),
+    Activity(String),
+    AnalysisComplete(Result<AnalysisSnapshot, String>),
+    ProcessProgress {
+        completed_batches: usize,
+        total_batches: usize,
+        label: String,
+    },
+    ProcessComplete(Result<(), String>),
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ButtonTone {
-    Primary,
+    Accent,
     Secondary,
-    Critical,
+    Danger,
     Ghost,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SwissButton {
+struct NativeButton {
     tone: ButtonTone,
 }
 
-impl SwissButton {
+impl NativeButton {
     const fn new(tone: ButtonTone) -> Self {
         Self { tone }
     }
 
     fn palette(self) -> (Option<Color>, Color, Color) {
         match self.tone {
-            ButtonTone::Primary => (
-                Some(Color::from_rgb8(19, 96, 218)),
-                Color::from_rgb8(16, 80, 181),
+            ButtonTone::Accent => (
+                Some(Color::from_rgb8(17, 108, 219)),
+                Color::from_rgb8(12, 85, 179),
                 Color::WHITE,
             ),
             ButtonTone::Secondary => (
-                Some(Color::from_rgb8(243, 246, 251)),
-                Color::from_rgb8(209, 216, 228),
-                Color::from_rgb8(31, 38, 48),
+                Some(Color::from_rgb8(239, 244, 252)),
+                Color::from_rgb8(212, 223, 238),
+                Color::from_rgb8(26, 40, 57),
             ),
-            ButtonTone::Critical => (
-                Some(Color::from_rgb8(181, 57, 63)),
-                Color::from_rgb8(151, 42, 47),
+            ButtonTone::Danger => (
+                Some(Color::from_rgb8(188, 61, 67)),
+                Color::from_rgb8(153, 47, 52),
                 Color::WHITE,
             ),
             ButtonTone::Ghost => (
-                None,
-                Color::from_rgb8(196, 205, 218),
-                Color::from_rgb8(69, 82, 98),
+                Some(Color::from_rgba8(236, 242, 251, 0.74)),
+                Color::from_rgb8(210, 220, 236),
+                Color::from_rgb8(70, 84, 104),
             ),
         }
     }
 }
 
-impl iced::widget::button::StyleSheet for SwissButton {
+impl iced::widget::button::StyleSheet for NativeButton {
     type Style = Theme;
 
     fn active(&self, _style: &Self::Style) -> iced::widget::button::Appearance {
         let (bg, border, text_color) = self.palette();
-        let background = match self.tone {
-            ButtonTone::Ghost => Some(Background::Color(Color::from_rgba8(237, 242, 250, 0.58))),
-            _ => bg.map(Background::Color),
-        };
-
         iced::widget::button::Appearance {
             shadow_offset: Vector::default(),
-            background,
+            background: bg.map(Background::Color),
             text_color,
             border: Border {
                 color: border,
@@ -116,47 +167,37 @@ impl iced::widget::button::StyleSheet for SwissButton {
                 radius: 14.0.into(),
             },
             shadow: Shadow {
-                color: Color::from_rgba8(10, 18, 32, 0.12),
+                color: Color::from_rgba8(9, 16, 30, 0.10),
                 offset: Vector::new(0.0, 1.0),
-                blur_radius: 3.0,
+                blur_radius: 4.0,
             },
         }
     }
 
     fn hovered(&self, _style: &Self::Style) -> iced::widget::button::Appearance {
         let (bg, border, text_color) = self.palette();
-        let background = match self.tone {
-            ButtonTone::Ghost => Some(Background::Color(Color::from_rgba8(230, 236, 248, 0.86))),
-            _ => bg.map(|c| Background::Color(lighten(c, 0.05))),
-        };
-
         iced::widget::button::Appearance {
             shadow_offset: Vector::default(),
-            background,
+            background: bg.map(|value| Background::Color(lighten(value, 0.03))),
             text_color,
             border: Border {
-                color: darken(border, 0.05),
+                color: darken(border, 0.04),
                 width: 1.0,
                 radius: 14.0.into(),
             },
             shadow: Shadow {
-                color: Color::from_rgba8(10, 18, 32, 0.16),
+                color: Color::from_rgba8(9, 16, 30, 0.14),
                 offset: Vector::new(0.0, 2.0),
-                blur_radius: 6.0,
+                blur_radius: 8.0,
             },
         }
     }
 
     fn pressed(&self, _style: &Self::Style) -> iced::widget::button::Appearance {
         let (bg, border, text_color) = self.palette();
-        let background = match self.tone {
-            ButtonTone::Ghost => Some(Background::Color(Color::from_rgba8(224, 232, 246, 0.9))),
-            _ => bg.map(|c| Background::Color(darken(c, 0.07))),
-        };
-
         iced::widget::button::Appearance {
             shadow_offset: Vector::default(),
-            background,
+            background: bg.map(|value| Background::Color(darken(value, 0.07))),
             text_color,
             border: Border {
                 color: darken(border, 0.08),
@@ -164,7 +205,7 @@ impl iced::widget::button::StyleSheet for SwissButton {
                 radius: 14.0.into(),
             },
             shadow: Shadow {
-                color: Color::from_rgba8(10, 18, 32, 0.10),
+                color: Color::from_rgba8(9, 16, 30, 0.08),
                 offset: Vector::new(0.0, 0.0),
                 blur_radius: 2.0,
             },
@@ -172,55 +213,78 @@ impl iced::widget::button::StyleSheet for SwissButton {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum StatusTone {
-    Idle,
-    Running,
-    Success,
-    Error,
-}
-
 #[derive(Debug, Clone)]
 enum Message {
     BrowseFolder,
-    ShowCover,
-    ShowPlan,
-    Process,
-    ClearLog,
+    RefreshAnalysis,
+    RequestProcess,
+    CancelProcessConfirmation,
+    ConfirmProcess,
     Tick,
 }
 
 struct MangaCleanerApp {
     series_dir_input: String,
     status_text: String,
-    running: bool,
-    log_text: String,
+    analysis_stage: StageState,
+    plan_stage: StageState,
+    process_stage: StageState,
+    analysis_running: bool,
+    processing_running: bool,
+    show_confirm_sheet: bool,
+    process_progress: f32,
+    process_label: String,
+    analysis: Option<AnalysisSnapshot>,
     cover_path: Option<PathBuf>,
     cover_handle: Option<iced::widget::image::Handle>,
+    activity: Vec<ActivityItem>,
     worker_rx: Option<Receiver<WorkerEvent>>,
-    terminal_scroll_id: ScrollableId,
 }
 
 impl MangaCleanerApp {
-    fn append_log_line(&mut self, line: impl AsRef<str>) {
-        let line = line.as_ref();
-        if !self.log_text.is_empty() {
-            self.log_text.push('\n');
-        }
-        self.log_text.push_str(line);
+    fn is_busy(&self) -> bool {
+        self.analysis_running || self.processing_running
+    }
 
-        let max_chars = 180_000;
-        if self.log_text.len() > max_chars {
-            let mut drop_to = self.log_text.len() - max_chars;
-            while drop_to < self.log_text.len() && !self.log_text.is_char_boundary(drop_to) {
-                drop_to += 1;
-            }
-            self.log_text.drain(..drop_to);
+    fn can_refresh(&self) -> bool {
+        !self.is_busy() && !self.series_dir_input.trim().is_empty()
+    }
+
+    fn can_process(&self) -> bool {
+        !self.is_busy()
+            && self.analysis.is_some()
+            && self.analysis_stage == StageState::Complete
+            && self.plan_stage == StageState::Complete
+            && self.process_stage != StageState::Complete
+    }
+
+    fn append_activity(&mut self, tone: ActivityTone, message: impl AsRef<str>) {
+        let text = message.as_ref().trim();
+        if text.is_empty() {
+            return;
+        }
+
+        self.activity.push(ActivityItem {
+            tone,
+            message: text.to_string(),
+        });
+
+        let max_items = 180;
+        if self.activity.len() > max_items {
+            let remove_count = self.activity.len() - max_items;
+            self.activity.drain(0..remove_count);
         }
     }
 
-    fn set_status_error(&mut self, message: impl AsRef<str>) {
-        self.status_text = format!("Error: {}", message.as_ref());
+    fn reset_for_new_analysis(&mut self) {
+        self.analysis = None;
+        self.set_cover_path(None);
+        self.process_progress = 0.0;
+        self.process_label = "Waiting for analysis".to_string();
+        self.show_confirm_sheet = false;
+        self.process_stage = StageState::Pending;
+        self.analysis_stage = StageState::Pending;
+        self.plan_stage = StageState::Pending;
     }
 
     fn set_cover_path(&mut self, path: Option<PathBuf>) {
@@ -228,96 +292,252 @@ impl MangaCleanerApp {
         self.cover_handle = path.map(iced::widget::image::Handle::from_path);
     }
 
-    fn status_tone(&self) -> StatusTone {
-        if self.running {
-            StatusTone::Running
-        } else if self.status_text.starts_with("Error") || self.status_text == "Failed" {
-            StatusTone::Error
-        } else if self.status_text.starts_with("Done") || self.status_text == "Folder selected" {
-            StatusTone::Success
-        } else {
-            StatusTone::Idle
-        }
+    fn set_series_folder(&mut self, raw_path: impl AsRef<str>) {
+        self.series_dir_input = raw_path.as_ref().to_string();
+        self.activity.clear();
+        self.reset_for_new_analysis();
+        self.start_analysis();
     }
 
-    fn can_run_actions(&self) -> bool {
-        !self.running && !self.series_dir_input.trim().is_empty()
-    }
-
-    fn start_action(&mut self, action: UiAction) {
-        if self.running {
+    fn start_analysis(&mut self) {
+        if self.is_busy() {
             return;
         }
 
-        let series_dir = match resolve_series_dir(&self.series_dir_input) {
-            Ok(path) => path,
-            Err(err) => {
-                self.set_status_error(err.to_string());
-                self.append_log_line(format!("[UI-ERROR] {err}"));
-                return;
-            }
-        };
+        let raw_path = self.series_dir_input.trim().to_string();
+        if raw_path.is_empty() {
+            self.status_text = "Choose a series folder to begin.".to_string();
+            return;
+        }
+
+        self.analysis_running = true;
+        self.processing_running = false;
+        self.analysis_stage = StageState::Running;
+        self.plan_stage = StageState::Pending;
+        self.process_stage = StageState::Pending;
+        self.status_text = "Running automatic checks...".to_string();
+        self.process_label = "Preparing analysis...".to_string();
+        self.append_activity(
+            ActivityTone::Info,
+            "Running automatic checks and building a processing plan.",
+        );
 
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
-        self.running = true;
-        self.status_text = format!("Running: {}", action.label());
-
-        self.append_log_line("");
-        self.append_log_line("=".repeat(92));
-        self.append_log_line(format!("[{}]", action.action_title()));
 
         thread::spawn(move || {
-            let tx_log = tx.clone();
-            let mut send_log = move |line: String| {
-                let _ = tx_log.send(WorkerEvent::Log(line));
+            let resolved = match resolve_series_dir(&raw_path) {
+                Ok(path) => path,
+                Err(err) => {
+                    let _ = tx.send(WorkerEvent::AnalysisComplete(Err(err.to_string())));
+                    return;
+                }
             };
 
-            let result =
-                run_action(action, &series_dir, &mut send_log).map_err(|err| err.to_string());
-            let _ = tx.send(WorkerEvent::Done(result));
+            let _ = tx.send(WorkerEvent::Activity(format!(
+                "Analyzing source folder: {}",
+                resolved.display()
+            )));
+
+            let series_title = leaf_name(&resolved);
+            let mut log = |line: String| {
+                let _ = tx.send(WorkerEvent::Activity(line));
+            };
+
+            let result = (|| -> Result<AnalysisSnapshot, String> {
+                let series_cover = ensure_series_cover(&resolved, &series_title, &mut log)
+                    .map_err(|err| err.to_string())?;
+
+                let cover_path = if let Some(ref selected_cover) = series_cover {
+                    Some(
+                        ensure_cover_jpg(&resolved, selected_cover)
+                            .map_err(|err| err.to_string())?,
+                    )
+                } else {
+                    None
+                };
+
+                let plan = build_plan(&resolved, series_cover.as_deref())
+                    .map_err(|err| err.to_string())?;
+                let volume_count: usize = plan.iter().map(|batch| batch.moves.len()).sum();
+                let rename_count = plan
+                    .iter()
+                    .flat_map(|batch| batch.moves.iter())
+                    .filter(|mv| leaf_name(&mv.src) != mv.dst_name)
+                    .count();
+
+                Ok(AnalysisSnapshot {
+                    resolved_dir: resolved,
+                    cover_path,
+                    plan,
+                    volume_count,
+                    rename_count,
+                })
+            })();
+
+            let _ = tx.send(WorkerEvent::AnalysisComplete(result));
         });
     }
 
-    fn drain_worker_events(&mut self) -> bool {
-        let mut appended = false;
-        let mut finished = false;
-        let Some(rx) = self.worker_rx.take() else {
-            return false;
+    fn start_process(&mut self) {
+        if !self.can_process() {
+            return;
+        }
+
+        let Some(snapshot) = self.analysis.clone() else {
+            return;
         };
+
+        let plan = snapshot.plan.clone();
+        let series_cover = snapshot.cover_path.clone();
+        let total_batches = plan.len().max(1);
+
+        self.processing_running = true;
+        self.analysis_running = false;
+        self.show_confirm_sheet = false;
+        self.process_stage = StageState::Running;
+        self.status_text = "Applying file changes...".to_string();
+        self.process_progress = 0.0;
+        self.process_label = format!("Starting {} batches", plan.len());
+        self.append_activity(
+            ActivityTone::Info,
+            "Confirmation received. Applying the approved batch plan.",
+        );
+
+        let (tx, rx) = mpsc::channel();
+        self.worker_rx = Some(rx);
+
+        thread::spawn(move || {
+            let mut log = |line: String| {
+                if let Some((batch_index, batch_name)) = parse_batch_start(&line) {
+                    let completed = batch_index.saturating_sub(1);
+                    let _ = tx.send(WorkerEvent::ProcessProgress {
+                        completed_batches: completed,
+                        total_batches,
+                        label: format!("Processing {batch_name}"),
+                    });
+                }
+
+                if line.starts_with("[COMPLETE]") {
+                    let _ = tx.send(WorkerEvent::ProcessProgress {
+                        completed_batches: total_batches,
+                        total_batches,
+                        label: "Finalizing".to_string(),
+                    });
+                }
+
+                let _ = tx.send(WorkerEvent::Activity(line));
+            };
+
+            let result =
+                execute(&plan, series_cover.as_deref(), &mut log).map_err(|err| err.to_string());
+            let _ = tx.send(WorkerEvent::ProcessComplete(result));
+        });
+    }
+
+    fn drain_worker_events(&mut self) {
+        let Some(rx) = self.worker_rx.take() else {
+            return;
+        };
+
+        let mut finished = false;
 
         while let Ok(event) = rx.try_recv() {
             match event {
-                WorkerEvent::Log(line) => {
-                    self.append_log_line(line);
-                    appended = true;
+                WorkerEvent::Activity(line) => {
+                    if let Some(message) = humanize_activity_line(&line) {
+                        self.append_activity(activity_tone(&line), message);
+                    }
                 }
-                WorkerEvent::Done(result) => {
+                WorkerEvent::AnalysisComplete(result) => {
                     finished = true;
-                    self.running = false;
+                    self.analysis_running = false;
 
                     match result {
-                        Ok(output) => {
-                            self.status_text = format!("Done: {}", output.action.label());
-                            self.append_log_line(format!(
-                                "[UI] Action completed successfully ({}).",
-                                output.action.label()
-                            ));
-                            appended = true;
+                        Ok(snapshot) => {
+                            let cover_path = snapshot.cover_path.clone();
+                            self.status_text =
+                                "Plan ready. Review and confirm processing.".to_string();
+                            self.analysis_stage = StageState::Complete;
+                            self.plan_stage = StageState::Complete;
+                            self.process_stage = StageState::Pending;
+                            self.process_progress = 0.0;
+                            self.process_label =
+                                format!("{} batches ready", snapshot.batch_count());
 
-                            if let Some(path) = output.cover_path {
-                                self.append_log_line(format!(
-                                    "[UI] Cover loaded in-app: {}",
-                                    path.display()
-                                ));
-                                appended = true;
-                                self.set_cover_path(Some(path));
+                            self.append_activity(
+                                ActivityTone::Success,
+                                format!(
+                                    "{} volumes organized into {} batches.",
+                                    snapshot.volume_count,
+                                    snapshot.batch_count()
+                                ),
+                            );
+
+                            if let Some(path) = cover_path.clone() {
+                                self.append_activity(
+                                    ActivityTone::Success,
+                                    format!("Cover preview ready from {}", path.display()),
+                                );
+                            } else {
+                                self.append_activity(
+                                    ActivityTone::Warning,
+                                    "No cover found. Batch folders will skip generated covers.",
+                                );
                             }
+
+                            self.analysis = Some(snapshot);
+                            self.set_cover_path(cover_path);
                         }
                         Err(err) => {
-                            self.status_text = "Failed".to_string();
-                            self.append_log_line(format!("[UI] Action failed: {err}"));
-                            appended = true;
+                            self.status_text = format!("Could not build plan: {err}");
+                            self.analysis_stage = StageState::Error;
+                            self.plan_stage = StageState::Error;
+                            self.process_stage = StageState::Pending;
+                            self.analysis = None;
+                            self.set_cover_path(None);
+                            self.append_activity(
+                                ActivityTone::Error,
+                                format!("Automatic checks failed: {err}"),
+                            );
+                        }
+                    }
+                }
+                WorkerEvent::ProcessProgress {
+                    completed_batches,
+                    total_batches,
+                    label,
+                } => {
+                    let pct = if total_batches == 0 {
+                        0.0
+                    } else {
+                        completed_batches as f32 / total_batches as f32
+                    };
+                    self.process_progress = pct.clamp(0.0, 1.0);
+                    self.process_label = label;
+                }
+                WorkerEvent::ProcessComplete(result) => {
+                    finished = true;
+                    self.processing_running = false;
+
+                    match result {
+                        Ok(()) => {
+                            self.process_stage = StageState::Complete;
+                            self.process_progress = 1.0;
+                            self.process_label = "All batches complete".to_string();
+                            self.status_text = "Processing finished.".to_string();
+                            self.append_activity(
+                                ActivityTone::Success,
+                                "Processing finished. Files and covers were updated.",
+                            );
+                        }
+                        Err(err) => {
+                            self.process_stage = StageState::Error;
+                            self.status_text = format!("Processing failed: {err}");
+                            self.append_activity(
+                                ActivityTone::Error,
+                                format!("Processing failed: {err}"),
+                            );
                         }
                     }
                 }
@@ -327,39 +547,256 @@ impl MangaCleanerApp {
         if !finished {
             self.worker_rx = Some(rx);
         }
-        appended
     }
 
-    fn current_cover_path_text(&self) -> String {
-        self.cover_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "No cover loaded.".to_string())
-    }
-
-    fn current_series_dir_text(&self) -> String {
-        let value = self.series_dir_input.trim();
-        if value.is_empty() {
-            "No folder selected. Use Browse Folder to choose one.".to_string()
+    fn status_chip_palette(&self) -> (Color, Color, Color, &'static str) {
+        if self.analysis_stage == StageState::Error || self.process_stage == StageState::Error {
+            (
+                Color::from_rgba8(208, 79, 84, 0.18),
+                Color::from_rgba8(181, 53, 58, 0.45),
+                Color::from_rgb8(138, 35, 40),
+                ICON_ERROR,
+            )
+        } else if self.is_busy() {
+            (
+                Color::from_rgba8(237, 184, 63, 0.22),
+                Color::from_rgba8(214, 151, 28, 0.50),
+                Color::from_rgb8(122, 78, 10),
+                ICON_RUNNING,
+            )
+        } else if self.process_stage == StageState::Complete {
+            (
+                Color::from_rgba8(55, 165, 116, 0.18),
+                Color::from_rgba8(42, 138, 94, 0.46),
+                Color::from_rgb8(25, 106, 73),
+                ICON_DONE,
+            )
         } else {
-            self.series_dir_input.clone()
+            (
+                Color::from_rgba8(99, 119, 147, 0.16),
+                Color::from_rgba8(99, 119, 147, 0.42),
+                Color::from_rgb8(67, 82, 103),
+                ICON_FLOW,
+            )
         }
     }
 
-    fn set_series_folder(&mut self, raw_path: impl AsRef<str>) {
-        self.series_dir_input = raw_path.as_ref().to_string();
-
-        match resolve_series_dir(&self.series_dir_input) {
-            Ok(path) => {
-                self.series_dir_input = path.display().to_string();
-                self.status_text = "Folder selected".to_string();
-                self.append_log_line(format!("[UI] Series folder selected: {}", path.display()));
-            }
-            Err(err) => {
-                self.set_status_error(err.to_string());
-                self.append_log_line(format!("[UI-ERROR] {err}"));
-            }
+    fn plan_detail_text(&self) -> String {
+        if self.plan_stage == StageState::Running {
+            "Building move map".to_string()
+        } else if let Some(snapshot) = &self.analysis {
+            format!(
+                "{} batches, {} renames",
+                snapshot.batch_count(),
+                snapshot.rename_count
+            )
+        } else if self.plan_stage == StageState::Error {
+            "Plan unavailable".to_string()
+        } else {
+            "Awaiting folder analysis".to_string()
         }
+    }
+
+    fn process_detail_text(&self) -> String {
+        if self.processing_running {
+            self.process_label.clone()
+        } else if self.process_stage == StageState::Complete {
+            "Completed".to_string()
+        } else if self.process_stage == StageState::Error {
+            "Failed".to_string()
+        } else {
+            "Final confirmation required".to_string()
+        }
+    }
+
+    fn render_cover_preview(&self) -> Element<'_, Message> {
+        if let Some(handle) = &self.cover_handle {
+            container(
+                image(handle.clone())
+                    .content_fit(iced::ContentFit::Contain)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .padding(10)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(cover_surface)
+            .into()
+        } else {
+            container(
+                column![
+                    text(ICON_COVER)
+                        .font(FONT_SYMBOLS)
+                        .size(30)
+                        .style(theme::Text::Color(Color::from_rgb8(117, 131, 152))),
+                    text("Cover preview will appear here")
+                        .font(FONT_DISPLAY)
+                        .size(15)
+                        .style(theme::Text::Color(Color::from_rgb8(74, 88, 109))),
+                    text("Auto checks resolve the best local or remote cover before planning.")
+                        .font(FONT_TEXT)
+                        .size(12)
+                        .style(theme::Text::Color(Color::from_rgb8(103, 116, 136))),
+                ]
+                .spacing(8)
+                .align_items(Alignment::Center),
+            )
+            .padding([16, 18])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x()
+            .center_y()
+            .style(cover_placeholder_surface)
+            .into()
+        }
+    }
+
+    fn render_plan_tree(&self) -> Element<'_, Message> {
+        let Some(snapshot) = &self.analysis else {
+            return container(
+                column![
+                    text("Plan preview")
+                        .font(FONT_DISPLAY)
+                        .size(17)
+                        .style(theme::Text::Color(Color::from_rgb8(35, 48, 64))),
+                    text("Choose a folder to generate batch and move previews automatically.")
+                        .font(FONT_TEXT)
+                        .size(13)
+                        .style(theme::Text::Color(Color::from_rgb8(89, 104, 124))),
+                ]
+                .spacing(8),
+            )
+            .padding([18, 20])
+            .style(card_surface)
+            .into();
+        };
+
+        let mut batches = column![
+            row![
+                text("Planned File Tree")
+                    .font(FONT_DISPLAY)
+                    .size(18)
+                    .style(theme::Text::Color(Color::from_rgb8(33, 46, 62))),
+                horizontal_space(),
+                chip(
+                    format!("{} batches", snapshot.batch_count()),
+                    Color::from_rgba8(36, 128, 197, 0.14),
+                    Color::from_rgba8(36, 128, 197, 0.35),
+                    Color::from_rgb8(23, 87, 132),
+                ),
+            ]
+            .align_items(Alignment::Center),
+            text("Preview of destination folders and move/rename operations.")
+                .font(FONT_TEXT)
+                .size(12)
+                .style(theme::Text::Color(Color::from_rgb8(94, 109, 129))),
+            horizontal_rule(1),
+        ]
+        .spacing(10);
+
+        for batch in &snapshot.plan {
+            let mut rows = column![].spacing(8);
+            for mv in &batch.moves {
+                let src_name = leaf_name(&mv.src);
+                let renamed = src_name != mv.dst_name;
+                let action_chip = if renamed {
+                    chip(
+                        "Rename".to_string(),
+                        Color::from_rgba8(44, 132, 208, 0.14),
+                        Color::from_rgba8(44, 132, 208, 0.34),
+                        Color::from_rgb8(19, 92, 145),
+                    )
+                } else {
+                    chip(
+                        "Move".to_string(),
+                        Color::from_rgba8(104, 123, 150, 0.14),
+                        Color::from_rgba8(104, 123, 150, 0.30),
+                        Color::from_rgb8(66, 81, 100),
+                    )
+                };
+
+                rows = rows.push(
+                    row![
+                        action_chip,
+                        text(src_name)
+                            .font(FONT_TEXT)
+                            .size(13)
+                            .style(theme::Text::Color(Color::from_rgb8(44, 57, 74))),
+                        text(ICON_ARROW)
+                            .font(FONT_SYMBOLS)
+                            .size(12)
+                            .style(theme::Text::Color(Color::from_rgb8(109, 122, 141))),
+                        text(&mv.dst_name)
+                            .font(FONT_TEXT)
+                            .size(13)
+                            .style(theme::Text::Color(Color::from_rgb8(25, 37, 52))),
+                    ]
+                    .spacing(8)
+                    .align_items(Alignment::Center),
+                );
+            }
+
+            if batch.will_make_cover {
+                rows = rows.push(
+                    row![
+                        chip(
+                            "Cover".to_string(),
+                            Color::from_rgba8(52, 158, 116, 0.14),
+                            Color::from_rgba8(52, 158, 116, 0.34),
+                            Color::from_rgb8(26, 116, 84),
+                        ),
+                        text("Create cover.jpg and preserve existing covers as cover_old_*.")
+                            .font(FONT_TEXT)
+                            .size(12)
+                            .style(theme::Text::Color(Color::from_rgb8(54, 73, 93))),
+                    ]
+                    .spacing(8)
+                    .align_items(Alignment::Center),
+                );
+            }
+
+            let start = (batch.batch_index - 1) * FILES_PER_FOLDER + 1;
+            let end = start + batch.moves.len().saturating_sub(1);
+
+            let batch_card = container(
+                column![
+                    row![
+                        text(format!(
+                            "Batch {}  (volumes {}-{})",
+                            batch.batch_index, start, end
+                        ))
+                        .font(FONT_DISPLAY)
+                        .size(16)
+                        .style(theme::Text::Color(Color::from_rgb8(33, 47, 63))),
+                        horizontal_space(),
+                        chip(
+                            format!("{} files", batch.moves.len()),
+                            Color::from_rgba8(88, 106, 136, 0.14),
+                            Color::from_rgba8(88, 106, 136, 0.30),
+                            Color::from_rgb8(62, 77, 98),
+                        ),
+                    ]
+                    .align_items(Alignment::Center),
+                    text(batch.batch_dir.display().to_string())
+                        .font(FONT_TEXT)
+                        .size(12)
+                        .style(theme::Text::Color(Color::from_rgb8(100, 114, 133))),
+                    horizontal_rule(1),
+                    rows,
+                ]
+                .spacing(9),
+            )
+            .padding([14, 15])
+            .style(plan_batch_surface);
+
+            batches = batches.push(batch_card);
+        }
+
+        container(scrollable(batches).height(Length::Fill))
+            .padding([14, 15])
+            .height(Length::Fill)
+            .style(card_surface)
+            .into()
     }
 }
 
@@ -372,16 +809,27 @@ impl Application for MangaCleanerApp {
     fn new(flags: Self::Flags) -> (Self, Command<Self::Message>) {
         let mut app = Self {
             series_dir_input: flags.initial_series_dir,
-            status_text: "Idle".to_string(),
-            running: false,
-            log_text: String::new(),
+            status_text: "Choose a folder to start.".to_string(),
+            analysis_stage: StageState::Pending,
+            plan_stage: StageState::Pending,
+            process_stage: StageState::Pending,
+            analysis_running: false,
+            processing_running: false,
+            show_confirm_sheet: false,
+            process_progress: 0.0,
+            process_label: "Waiting for analysis".to_string(),
+            analysis: None,
             cover_path: None,
             cover_handle: None,
+            activity: Vec::new(),
             worker_rx: None,
-            terminal_scroll_id: ScrollableId::new("live_output_terminal"),
         };
 
-        app.append_log_line("[UI] Ready. Select a series folder, then choose an action.");
+        app.append_activity(
+            ActivityTone::Info,
+            "Select a series folder. Checks and planning run automatically.",
+        );
+
         if !app.series_dir_input.trim().is_empty() {
             let initial = app.series_dir_input.clone();
             app.set_series_folder(initial);
@@ -396,27 +844,25 @@ impl Application for MangaCleanerApp {
 
     fn theme(&self) -> Self::Theme {
         Theme::custom(
-            "Swiss Modern".to_string(),
+            "Quartz Native".to_string(),
             theme::Palette {
-                background: Color::from_rgb8(244, 246, 250),
-                text: Color::from_rgb8(20, 25, 34),
-                primary: Color::from_rgb8(19, 96, 218),
-                success: Color::from_rgb8(26, 129, 94),
-                danger: Color::from_rgb8(195, 66, 71),
+                background: Color::from_rgb8(243, 247, 252),
+                text: Color::from_rgb8(21, 30, 41),
+                primary: Color::from_rgb8(17, 108, 219),
+                success: Color::from_rgb8(31, 142, 101),
+                danger: Color::from_rgb8(194, 66, 72),
             },
         )
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        time::every(Duration::from_millis(150)).map(|_| Message::Tick)
+        time::every(Duration::from_millis(120)).map(|_| Message::Tick)
     }
 
     fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
-        let mut command = Command::none();
-
         match message {
             Message::BrowseFolder => {
-                if self.running {
+                if self.is_busy() {
                     return Command::none();
                 }
 
@@ -424,79 +870,58 @@ impl Application for MangaCleanerApp {
                     self.set_series_folder(folder.display().to_string());
                 }
             }
-            Message::ShowCover => {
-                self.start_action(UiAction::ShowCover);
+            Message::RefreshAnalysis => {
+                if self.can_refresh() {
+                    self.activity.clear();
+                    self.reset_for_new_analysis();
+                    self.start_analysis();
+                }
             }
-            Message::ShowPlan => {
-                self.start_action(UiAction::Preview);
+            Message::RequestProcess => {
+                if self.can_process() {
+                    self.show_confirm_sheet = true;
+                }
             }
-            Message::Process => {
-                self.start_action(UiAction::Process);
+            Message::CancelProcessConfirmation => {
+                self.show_confirm_sheet = false;
             }
-            Message::ClearLog => {
-                self.log_text.clear();
-                self.append_log_line("[UI] Terminal cleared.");
+            Message::ConfirmProcess => {
+                self.show_confirm_sheet = false;
+                self.start_process();
             }
             Message::Tick => {
-                if self.drain_worker_events() {
-                    command = scrollable::snap_to(
-                        self.terminal_scroll_id.clone(),
-                        RelativeOffset { x: 0.0, y: 1.0 },
-                    );
-                }
+                self.drain_worker_events();
             }
         }
 
-        command
+        Command::none()
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        let status_tone = self.status_tone();
-        let (status_bg, status_border, status_text) = match status_tone {
-            StatusTone::Idle => (
-                Color::from_rgba8(124, 138, 158, 0.16),
-                Color::from_rgba8(124, 138, 158, 0.45),
-                Color::from_rgb8(67, 79, 96),
-            ),
-            StatusTone::Running => (
-                Color::from_rgba8(239, 189, 70, 0.2),
-                Color::from_rgba8(217, 160, 36, 0.55),
-                Color::from_rgb8(125, 82, 8),
-            ),
-            StatusTone::Success => (
-                Color::from_rgba8(52, 167, 114, 0.17),
-                Color::from_rgba8(45, 143, 99, 0.45),
-                Color::from_rgb8(19, 112, 74),
-            ),
-            StatusTone::Error => (
-                Color::from_rgba8(204, 74, 79, 0.17),
-                Color::from_rgba8(182, 54, 60, 0.45),
-                Color::from_rgb8(136, 34, 40),
-            ),
-        };
+        let (status_bg, status_border, status_color, status_icon) = self.status_chip_palette();
 
         let title_block = column![
             text("Manga Cleaner")
                 .font(FONT_DISPLAY)
-                .size(42)
-                .style(theme::Text::Color(Color::from_rgb8(16, 22, 30))),
-            text("Native batch cleanup for manga volumes")
+                .size(44)
+                .style(theme::Text::Color(Color::from_rgb8(16, 25, 35))),
+            text("Native-first manga batching with automatic checks and visual previews")
                 .font(FONT_TEXT)
                 .size(14)
-                .style(theme::Text::Color(Color::from_rgb8(90, 101, 118))),
+                .style(theme::Text::Color(Color::from_rgb8(87, 101, 121))),
         ]
-        .spacing(2);
+        .spacing(4);
 
         let status_chip = container(
             row![
-                text(ICON_STATUS)
+                text(status_icon)
                     .font(FONT_SYMBOLS)
                     .size(16)
-                    .style(theme::Text::Color(status_text)),
+                    .style(theme::Text::Color(status_color)),
                 text(&self.status_text)
                     .font(FONT_TEXT)
-                    .size(15)
-                    .style(theme::Text::Color(status_text)),
+                    .size(14)
+                    .style(theme::Text::Color(status_color)),
             ]
             .spacing(8)
             .align_items(Alignment::Center),
@@ -514,226 +939,384 @@ impl Application for MangaCleanerApp {
         });
 
         let topbar = row![title_block, horizontal_space(), status_chip]
-            .spacing(16)
+            .spacing(12)
             .align_items(Alignment::Center);
 
-        let mut browse_btn = button(
+        let mut browse_button = button(
             row![
                 text(ICON_FOLDER)
                     .font(FONT_SYMBOLS)
-                    .size(18)
+                    .size(17)
                     .style(theme::Text::Color(Color::WHITE)),
-                text("Browse Folder")
+                text("Choose Folder")
                     .font(FONT_DISPLAY)
-                    .size(16)
+                    .size(15)
                     .style(theme::Text::Color(Color::WHITE)),
             ]
-            .spacing(8)
+            .spacing(7)
             .align_items(Alignment::Center),
         )
-        .padding([12, 16])
-        .style(theme::Button::custom(SwissButton::new(ButtonTone::Primary)));
+        .padding([11, 15])
+        .style(theme::Button::custom(NativeButton::new(ButtonTone::Accent)));
 
-        if !self.running {
-            browse_btn = browse_btn.on_press(Message::BrowseFolder);
+        if !self.is_busy() {
+            browse_button = browse_button.on_press(Message::BrowseFolder);
         }
 
-        let folder_well = container(
-            column![
-                text("Selected Series Path")
+        let mut refresh_button = button(
+            row![
+                text(ICON_REFRESH)
+                    .font(FONT_SYMBOLS)
+                    .size(16)
+                    .style(theme::Text::Color(Color::from_rgb8(40, 57, 77))),
+                text("Run Checks Again")
                     .font(FONT_TEXT)
-                    .size(12)
-                    .style(theme::Text::Color(Color::from_rgb8(109, 118, 133))),
-                text(self.current_series_dir_text())
-                    .font(Font::MONOSPACE)
                     .size(14)
-                    .style(theme::Text::Color(Color::from_rgb8(37, 45, 58))),
+                    .style(theme::Text::Color(Color::from_rgb8(40, 57, 77))),
             ]
-            .spacing(5),
+            .spacing(7)
+            .align_items(Alignment::Center),
         )
-        .padding([12, 14])
-        .width(Length::Fill)
-        .style(|_theme: &Theme| iced::widget::container::Appearance {
-            text_color: None,
-            background: Some(Background::Color(Color::from_rgba8(252, 253, 255, 0.95))),
-            border: Border {
-                color: Color::from_rgb8(217, 223, 234),
-                width: 1.0,
-                radius: 12.0.into(),
-            },
-            shadow: Shadow::default(),
-        });
+        .padding([11, 14])
+        .style(theme::Button::custom(NativeButton::new(
+            ButtonTone::Secondary,
+        )));
 
-        let controls_card = container(
+        if self.can_refresh() {
+            refresh_button = refresh_button.on_press(Message::RefreshAnalysis);
+        }
+
+        let source_card = container(
             column![
                 row![
-                    text("Source")
-                        .font(FONT_DISPLAY)
-                        .size(14)
-                        .style(theme::Text::Color(Color::from_rgb8(42, 54, 68))),
+                    column![
+                        text("Source Folder")
+                            .font(FONT_DISPLAY)
+                            .size(15)
+                            .style(theme::Text::Color(Color::from_rgb8(37, 52, 70))),
+                        text("Auto checks run immediately. Only processing asks for confirmation.")
+                            .font(FONT_TEXT)
+                            .size(12)
+                            .style(theme::Text::Color(Color::from_rgb8(97, 111, 131))),
+                    ]
+                    .spacing(4),
                     horizontal_space(),
-                    browse_btn,
+                    row![browse_button, refresh_button].spacing(10),
                 ]
                 .align_items(Alignment::Center),
-                folder_well,
+                container(
+                    text(if self.series_dir_input.trim().is_empty() {
+                        "No folder selected yet.".to_string()
+                    } else {
+                        self.series_dir_input.clone()
+                    })
+                    .font(FONT_TEXT)
+                    .size(13)
+                    .style(theme::Text::Color(Color::from_rgb8(52, 66, 84))),
+                )
+                .padding([12, 14])
+                .width(Length::Fill)
+                .style(path_well_surface),
             ]
             .spacing(12),
         )
         .padding([16, 18])
         .style(card_surface);
 
-        let can_run = self.can_run_actions();
-
-        let show_cover_btn = action_button(
-            ICON_COVER,
-            "Show Cover",
-            "Resolve and preview the chosen series cover.",
-            ButtonTone::Secondary,
-            can_run,
-            Message::ShowCover,
-        );
-
-        let show_plan_btn = action_button(
-            ICON_PLAN,
-            "Show Plan",
-            "Preview folders, file moves, and generated covers.",
-            ButtonTone::Secondary,
-            can_run,
-            Message::ShowPlan,
-        );
-
-        let run_btn = action_button(
-            ICON_PROCESS,
-            "Commit + Process",
-            "Apply the full file and cover workflow immediately.",
-            ButtonTone::Critical,
-            can_run,
-            Message::Process,
-        );
-
-        let clear_btn = button(
-            row![
-                text(ICON_CLEAR)
-                    .font(FONT_SYMBOLS)
-                    .size(16)
-                    .style(theme::Text::Color(Color::from_rgb8(69, 82, 98))),
-                text("Clear Log")
-                    .font(FONT_TEXT)
-                    .size(14)
-                    .style(theme::Text::Color(Color::from_rgb8(69, 82, 98))),
-            ]
-            .spacing(6)
-            .align_items(Alignment::Center),
-        )
-        .padding([11, 14])
-        .style(theme::Button::custom(SwissButton::new(ButtonTone::Ghost)))
-        .on_press(Message::ClearLog);
-
-        let actions_card = container(
-            column![
-                row![show_cover_btn, show_plan_btn, run_btn]
-                    .spacing(10)
-                    .width(Length::Fill),
-                row![horizontal_space(), clear_btn].align_items(Alignment::Center),
-            ]
-            .spacing(10),
-        )
-        .padding([16, 18])
-        .style(card_surface);
-
-        let terminal = make_scrollable(
-            container(
-                text(&self.log_text)
-                    .font(Font::MONOSPACE)
-                    .size(13)
-                    .style(theme::Text::Color(Color::from_rgb8(203, 230, 218))),
-            )
-            .padding([14, 16])
-            .width(Length::Fill)
-            .style(terminal_output_surface),
-        )
-        .id(self.terminal_scroll_id.clone())
-        .height(Length::Fill);
-
-        let terminal_card = container(
-            column![
-                row![
-                    text(ICON_LOG)
-                        .font(FONT_SYMBOLS)
-                        .size(16)
-                        .style(theme::Text::Color(Color::from_rgb8(54, 74, 95))),
-                    text("Live Output")
-                        .font(FONT_DISPLAY)
-                        .size(16)
-                        .style(theme::Text::Color(Color::from_rgb8(31, 44, 58))),
-                ]
-                .spacing(8)
-                .align_items(Alignment::Center),
-                terminal,
-            ]
-            .spacing(10),
-        )
-        .padding([16, 18])
-        .width(Length::FillPortion(2))
-        .height(Length::Fill)
-        .style(card_surface);
-
-        let cover_preview: Element<'_, Message> = if let Some(handle) = &self.cover_handle {
-            container(
-                image(handle.clone())
-                    .content_fit(iced::ContentFit::Contain)
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-            )
-            .padding(8)
-            .height(Length::FillPortion(4))
-            .style(cover_frame_surface)
-            .into()
+        let analysis_detail = if self.analysis_running {
+            "Scanning files and cover sources".to_string()
+        } else if let Some(snapshot) = &self.analysis {
+            format!("{} files validated", snapshot.volume_count)
+        } else if self.analysis_stage == StageState::Error {
+            "Could not analyze source".to_string()
         } else {
-            container(
-                text("Run Show Cover to load the resolved cover in-app.")
-                    .font(FONT_TEXT)
-                    .size(13)
-                    .style(theme::Text::Color(Color::from_rgb8(85, 100, 118))),
-            )
-            .padding(12)
-            .width(Length::Fill)
-            .height(Length::FillPortion(4))
-            .center_x()
-            .center_y()
-            .style(cover_placeholder_surface)
-            .into()
+            "Waiting for folder selection".to_string()
         };
 
-        let preview_card = container(
-            column![
-                text("Cover Preview")
-                    .font(FONT_DISPLAY)
-                    .size(16)
-                    .style(theme::Text::Color(Color::from_rgb8(31, 44, 58))),
-                cover_preview,
-                text(self.current_cover_path_text())
-                    .font(Font::MONOSPACE)
-                    .size(12)
-                    .style(theme::Text::Color(Color::from_rgb8(100, 111, 125))),
-                text("Show Plan is dry-run only. Commit + Process writes all planned changes.")
-                    .font(FONT_TEXT)
-                    .size(12)
-                    .style(theme::Text::Color(Color::from_rgb8(92, 106, 122))),
+        let flow_card = container(
+            row![
+                stage_card("Auto Checks", analysis_detail, self.analysis_stage),
+                stage_card("Plan Preview", self.plan_detail_text(), self.plan_stage),
+                stage_card("Process", self.process_detail_text(), self.process_stage),
             ]
             .spacing(10),
         )
-        .padding([16, 18])
-        .width(Length::FillPortion(1))
-        .height(Length::Fill)
+        .padding([14, 16])
         .style(card_surface);
 
-        let split = row![terminal_card, preview_card]
-            .spacing(14)
+        let cover_card = container(
+            column![
+                row![
+                    text("Cover Preview")
+                        .font(FONT_DISPLAY)
+                        .size(16)
+                        .style(theme::Text::Color(Color::from_rgb8(31, 45, 62))),
+                    horizontal_space(),
+                    if self.cover_path.is_some() {
+                        chip(
+                            "Ready".to_string(),
+                            Color::from_rgba8(52, 158, 116, 0.14),
+                            Color::from_rgba8(52, 158, 116, 0.36),
+                            Color::from_rgb8(23, 110, 79),
+                        )
+                    } else {
+                        chip(
+                            "Pending".to_string(),
+                            Color::from_rgba8(120, 136, 160, 0.16),
+                            Color::from_rgba8(120, 136, 160, 0.36),
+                            Color::from_rgb8(77, 92, 112),
+                        )
+                    }
+                ]
+                .align_items(Alignment::Center),
+                container(self.render_cover_preview())
+                    .height(Length::FillPortion(4))
+                    .width(Length::Fill),
+                text(
+                    self.cover_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "No cover selected yet.".to_string()),
+                )
+                .font(FONT_TEXT)
+                .size(12)
+                .style(theme::Text::Color(Color::from_rgb8(101, 116, 136))),
+            ]
+            .spacing(10),
+        )
+        .padding([15, 16])
+        .height(Length::FillPortion(2))
+        .style(card_surface);
+
+        let summary_content = if let Some(snapshot) = &self.analysis {
+            column![
+                stat_line("Source", snapshot.resolved_dir.display().to_string()),
+                stat_line("Volumes", snapshot.volume_count.to_string()),
+                stat_line("Batches", snapshot.batch_count().to_string()),
+                stat_line("Renames", snapshot.rename_count.to_string()),
+                stat_line(
+                    "Cover output",
+                    if snapshot.cover_batch_count() > 0 {
+                        format!("{} folders", snapshot.cover_batch_count())
+                    } else {
+                        "Skipped".to_string()
+                    }
+                ),
+            ]
+            .spacing(8)
+        } else {
+            column![text("Plan summary will appear after automatic checks.")
+                .font(FONT_TEXT)
+                .size(13)
+                .style(theme::Text::Color(Color::from_rgb8(89, 104, 124))),]
+        };
+
+        let process_label = if self.processing_running {
+            "Processing..."
+        } else if self.process_stage == StageState::Complete {
+            "Completed"
+        } else {
+            "Process Files"
+        };
+
+        let mut process_button = button(
+            row![
+                text(ICON_PROCESS)
+                    .font(FONT_SYMBOLS)
+                    .size(17)
+                    .style(theme::Text::Color(Color::WHITE)),
+                text(process_label)
+                    .font(FONT_DISPLAY)
+                    .size(15)
+                    .style(theme::Text::Color(Color::WHITE)),
+            ]
+            .spacing(8)
+            .align_items(Alignment::Center),
+        )
+        .padding([12, 14])
+        .style(theme::Button::custom(NativeButton::new(ButtonTone::Danger)))
+        .width(Length::Fill);
+
+        if self.can_process() {
+            process_button = process_button.on_press(Message::RequestProcess);
+        }
+
+        let mut summary_column = column![
+            row![
+                text("Execution")
+                    .font(FONT_DISPLAY)
+                    .size(16)
+                    .style(theme::Text::Color(Color::from_rgb8(31, 45, 62))),
+                horizontal_space(),
+                if self.processing_running {
+                    chip(
+                        "Running".to_string(),
+                        Color::from_rgba8(235, 180, 57, 0.18),
+                        Color::from_rgba8(210, 147, 22, 0.40),
+                        Color::from_rgb8(122, 80, 14),
+                    )
+                } else if self.process_stage == StageState::Complete {
+                    chip(
+                        "Finished".to_string(),
+                        Color::from_rgba8(52, 158, 116, 0.14),
+                        Color::from_rgba8(52, 158, 116, 0.36),
+                        Color::from_rgb8(23, 110, 79),
+                    )
+                } else {
+                    chip(
+                        "Awaiting approval".to_string(),
+                        Color::from_rgba8(118, 134, 158, 0.16),
+                        Color::from_rgba8(118, 134, 158, 0.36),
+                        Color::from_rgb8(74, 89, 109),
+                    )
+                }
+            ]
+            .align_items(Alignment::Center),
+            summary_content,
+            progress_bar(0.0..=1.0, self.process_progress).height(Length::Fixed(8.0)),
+            text(&self.process_label)
+                .font(FONT_TEXT)
+                .size(12)
+                .style(theme::Text::Color(Color::from_rgb8(94, 108, 128))),
+            process_button,
+        ]
+        .spacing(10);
+
+        if self.show_confirm_sheet {
+            let destructive_summary = if let Some(snapshot) = &self.analysis {
+                format!(
+                    "This will move {} volume files into {} destination folders and write batch covers where available.",
+                    snapshot.volume_count,
+                    snapshot.batch_count()
+                )
+            } else {
+                "This will apply the prepared file and cover changes.".to_string()
+            };
+
+            let cancel_btn = button(
+                text("Not yet")
+                    .font(FONT_TEXT)
+                    .size(14)
+                    .style(theme::Text::Color(Color::from_rgb8(53, 69, 89))),
+            )
+            .padding([10, 14])
+            .style(theme::Button::custom(NativeButton::new(ButtonTone::Ghost)))
+            .on_press(Message::CancelProcessConfirmation);
+
+            let confirm_btn = button(
+                text("Confirm and Process")
+                    .font(FONT_DISPLAY)
+                    .size(14)
+                    .style(theme::Text::Color(Color::WHITE)),
+            )
+            .padding([10, 14])
+            .style(theme::Button::custom(NativeButton::new(ButtonTone::Danger)))
+            .on_press(Message::ConfirmProcess);
+
+            summary_column = summary_column.push(
+                container(
+                    column![
+                        text("Final Confirmation")
+                            .font(FONT_DISPLAY)
+                            .size(14)
+                            .style(theme::Text::Color(Color::from_rgb8(118, 34, 39))),
+                        text(destructive_summary)
+                            .font(FONT_TEXT)
+                            .size(12)
+                            .style(theme::Text::Color(Color::from_rgb8(113, 50, 54))),
+                        row![cancel_btn, confirm_btn]
+                            .spacing(9)
+                            .align_items(Alignment::Center),
+                    ]
+                    .spacing(10),
+                )
+                .padding([12, 13])
+                .style(confirm_surface),
+            );
+        }
+
+        let summary_card = container(summary_column)
+            .padding([15, 16])
+            .height(Length::FillPortion(2))
+            .style(card_surface);
+
+        let left_column = column![cover_card, summary_card]
+            .spacing(12)
+            .width(Length::FillPortion(1))
             .height(Length::Fill);
 
-        let content = column![topbar, controls_card, actions_card, split]
-            .spacing(14)
+        let plan_panel = container(self.render_plan_tree())
+            .width(Length::FillPortion(2))
+            .height(Length::Fill);
+
+        let workspace_row = row![left_column, plan_panel]
+            .spacing(12)
+            .height(Length::FillPortion(3));
+
+        let mut activity_list = column![
+            row![
+                text(ICON_ACTIVITY)
+                    .font(FONT_SYMBOLS)
+                    .size(16)
+                    .style(theme::Text::Color(Color::from_rgb8(57, 74, 96))),
+                text("Activity")
+                    .font(FONT_DISPLAY)
+                    .size(16)
+                    .style(theme::Text::Color(Color::from_rgb8(33, 47, 63))),
+            ]
+            .spacing(8)
+            .align_items(Alignment::Center),
+            horizontal_rule(1),
+        ]
+        .spacing(9);
+
+        if self.activity.is_empty() {
+            activity_list = activity_list.push(
+                text("No activity yet.")
+                    .font(FONT_TEXT)
+                    .size(12)
+                    .style(theme::Text::Color(Color::from_rgb8(96, 111, 131))),
+            );
+        } else {
+            for entry in &self.activity {
+                let dot_color = match entry.tone {
+                    ActivityTone::Info => Color::from_rgb8(86, 106, 134),
+                    ActivityTone::Success => Color::from_rgb8(37, 140, 101),
+                    ActivityTone::Warning => Color::from_rgb8(165, 112, 22),
+                    ActivityTone::Error => Color::from_rgb8(178, 53, 59),
+                };
+
+                let symbol = match entry.tone {
+                    ActivityTone::Info => ICON_WAITING,
+                    ActivityTone::Success => ICON_DONE,
+                    ActivityTone::Warning => ICON_RUNNING,
+                    ActivityTone::Error => ICON_ERROR,
+                };
+
+                activity_list = activity_list.push(
+                    row![
+                        text(symbol)
+                            .font(FONT_SYMBOLS)
+                            .size(12)
+                            .style(theme::Text::Color(dot_color)),
+                        text(&entry.message)
+                            .font(FONT_TEXT)
+                            .size(12)
+                            .style(theme::Text::Color(Color::from_rgb8(58, 73, 92))),
+                    ]
+                    .spacing(7)
+                    .align_items(Alignment::Center),
+                );
+            }
+        }
+
+        let activity_card = container(scrollable(activity_list).height(Length::Fill))
+            .padding([14, 15])
+            .height(Length::FillPortion(1))
+            .style(card_surface);
+
+        let content = column![topbar, source_card, flow_card, workspace_row, activity_card]
+            .spacing(12)
             .padding([18, 20])
             .width(Length::Fill)
             .height(Length::Fill);
@@ -741,112 +1324,211 @@ impl Application for MangaCleanerApp {
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_theme: &Theme| iced::widget::container::Appearance {
-                text_color: None,
-                background: Some(Background::Color(Color::from_rgb8(241, 244, 249))),
-                border: Border::default(),
-                shadow: Shadow::default(),
-            })
+            .style(app_surface)
             .into()
     }
 }
 
-fn action_button(
-    icon: &'static str,
-    title: &'static str,
-    detail: &'static str,
-    tone: ButtonTone,
-    enabled: bool,
-    message: Message,
-) -> iced::widget::Button<'static, Message> {
-    let (icon_color, title_color, detail_color) = match tone {
-        ButtonTone::Primary | ButtonTone::Critical => (
-            Color::WHITE,
-            Color::WHITE,
-            Color::from_rgba8(255, 255, 255, 0.84),
-        ),
-        ButtonTone::Secondary | ButtonTone::Ghost => (
-            Color::from_rgb8(33, 47, 63),
-            Color::from_rgb8(18, 27, 36),
-            Color::from_rgb8(89, 102, 118),
-        ),
-    };
+fn stage_card<'a>(title: &'a str, detail: String, state: StageState) -> Element<'a, Message> {
+    let (badge_text, badge_bg, badge_border, badge_color, icon) = stage_palette(state);
 
-    let alpha = if enabled { 1.0 } else { 0.58 };
-    let icon_color = with_alpha(icon_color, alpha);
-    let title_color = with_alpha(title_color, alpha);
-    let detail_color = with_alpha(detail_color, alpha);
+    container(
+        column![
+            row![
+                text(icon)
+                    .font(FONT_SYMBOLS)
+                    .size(14)
+                    .style(theme::Text::Color(badge_color)),
+                text(title)
+                    .font(FONT_DISPLAY)
+                    .size(14)
+                    .style(theme::Text::Color(Color::from_rgb8(35, 50, 68))),
+                horizontal_space(),
+                chip(badge_text.to_string(), badge_bg, badge_border, badge_color),
+            ]
+            .spacing(6)
+            .align_items(Alignment::Center),
+            text(detail)
+                .font(FONT_TEXT)
+                .size(12)
+                .style(theme::Text::Color(Color::from_rgb8(95, 111, 131))),
+        ]
+        .spacing(8),
+    )
+    .padding([11, 12])
+    .width(Length::FillPortion(1))
+    .style(flow_step_surface)
+    .into()
+}
 
-    let content = column![
-        text(icon)
-            .font(FONT_SYMBOLS)
-            .size(18)
-            .style(theme::Text::Color(icon_color)),
-        text(title)
-            .font(FONT_DISPLAY)
-            .size(16)
-            .style(theme::Text::Color(title_color)),
-        text(detail)
+fn stat_line<'a>(label: &'a str, value: String) -> Element<'a, Message> {
+    row![
+        text(label)
             .font(FONT_TEXT)
             .size(12)
-            .style(theme::Text::Color(detail_color)),
+            .style(theme::Text::Color(Color::from_rgb8(96, 111, 131))),
+        horizontal_space(),
+        text(value)
+            .font(FONT_TEXT)
+            .size(12)
+            .style(theme::Text::Color(Color::from_rgb8(43, 56, 74))),
     ]
-    .spacing(3)
-    .align_items(Alignment::Start)
-    .width(Length::Fill);
+    .align_items(Alignment::Center)
+    .into()
+}
 
-    let mut btn = button(content)
-        .padding([13, 14])
-        .width(Length::FillPortion(1))
-        .style(theme::Button::custom(SwissButton::new(tone)));
+fn chip<'a>(
+    value: String,
+    bg: Color,
+    border: Color,
+    text_color: Color,
+) -> iced::widget::Container<'a, Message> {
+    container(
+        text(value)
+            .font(FONT_TEXT)
+            .size(11)
+            .style(theme::Text::Color(text_color)),
+    )
+    .padding([4, 9])
+    .style(move |_theme: &Theme| iced::widget::container::Appearance {
+        text_color: None,
+        background: Some(Background::Color(bg)),
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: 999.0.into(),
+        },
+        shadow: Shadow::default(),
+    })
+}
 
-    if enabled {
-        btn = btn.on_press(message);
+fn stage_palette(state: StageState) -> (&'static str, Color, Color, Color, &'static str) {
+    match state {
+        StageState::Pending => (
+            "Waiting",
+            Color::from_rgba8(118, 134, 158, 0.14),
+            Color::from_rgba8(118, 134, 158, 0.32),
+            Color::from_rgb8(78, 92, 112),
+            ICON_WAITING,
+        ),
+        StageState::Running => (
+            "In progress",
+            Color::from_rgba8(235, 180, 57, 0.18),
+            Color::from_rgba8(210, 147, 22, 0.40),
+            Color::from_rgb8(122, 80, 14),
+            ICON_RUNNING,
+        ),
+        StageState::Complete => (
+            "Ready",
+            Color::from_rgba8(52, 158, 116, 0.14),
+            Color::from_rgba8(52, 158, 116, 0.34),
+            Color::from_rgb8(23, 110, 79),
+            ICON_DONE,
+        ),
+        StageState::Error => (
+            "Action needed",
+            Color::from_rgba8(208, 79, 84, 0.15),
+            Color::from_rgba8(181, 53, 58, 0.34),
+            Color::from_rgb8(138, 35, 40),
+            ICON_ERROR,
+        ),
+    }
+}
+
+fn humanize_activity_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
     }
 
-    btn
+    if trimmed.chars().all(|ch| ch == '-' || ch == '=') {
+        return None;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("[COVER] ") {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("[WARN] ") {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("[ERROR] ") {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("[DO] Batch ") {
+        return Some(format!("Processing {rest}"));
+    }
+    if let Some(rest) = trimmed.strip_prefix("[MOVE] ") {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("[COMPLETE] ") {
+        return Some(rest.to_string());
+    }
+
+    if trimmed.starts_with("[PLAN]") {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn activity_tone(line: &str) -> ActivityTone {
+    let lower = line.to_ascii_lowercase();
+    if line.contains("[ERROR]") || lower.contains("failed") {
+        ActivityTone::Error
+    } else if line.contains("[WARN]") {
+        ActivityTone::Warning
+    } else if line.contains("[COMPLETE]") || line.contains("[COVER]") {
+        ActivityTone::Success
+    } else {
+        ActivityTone::Info
+    }
+}
+
+fn parse_batch_start(line: &str) -> Option<(usize, String)> {
+    let rest = line.strip_prefix("[DO] Batch ")?;
+    let (index_raw, name_raw) = rest.split_once(':')?;
+    let batch_index = index_raw.trim().parse::<usize>().ok()?;
+    Some((batch_index, name_raw.trim().to_string()))
+}
+
+fn leaf_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn app_surface(_theme: &Theme) -> iced::widget::container::Appearance {
+    iced::widget::container::Appearance {
+        text_color: None,
+        background: Some(Background::Color(Color::from_rgb8(240, 246, 252))),
+        border: Border::default(),
+        shadow: Shadow::default(),
+    }
 }
 
 fn card_surface(_theme: &Theme) -> iced::widget::container::Appearance {
     iced::widget::container::Appearance {
         text_color: None,
-        background: Some(Background::Color(Color::from_rgb8(252, 253, 255))),
+        background: Some(Background::Color(Color::from_rgb8(252, 254, 255))),
         border: Border {
-            color: Color::from_rgb8(218, 224, 235),
+            color: Color::from_rgb8(215, 225, 238),
             width: 1.0,
             radius: 16.0.into(),
         },
         shadow: Shadow {
-            color: Color::from_rgba8(13, 20, 32, 0.06),
+            color: Color::from_rgba8(11, 22, 38, 0.07),
             offset: Vector::new(0.0, 2.0),
-            blur_radius: 10.0,
+            blur_radius: 12.0,
         },
     }
 }
 
-fn terminal_output_surface(_theme: &Theme) -> iced::widget::container::Appearance {
+fn flow_step_surface(_theme: &Theme) -> iced::widget::container::Appearance {
     iced::widget::container::Appearance {
         text_color: None,
-        background: Some(Background::Color(Color::from_rgb8(21, 31, 40))),
+        background: Some(Background::Color(Color::from_rgb8(246, 250, 255))),
         border: Border {
-            color: Color::from_rgb8(29, 46, 59),
-            width: 1.0,
-            radius: 12.0.into(),
-        },
-        shadow: Shadow {
-            color: Color::from_rgba8(0, 0, 0, 0.10),
-            offset: Vector::new(0.0, 2.0),
-            blur_radius: 6.0,
-        },
-    }
-}
-
-fn cover_placeholder_surface(_theme: &Theme) -> iced::widget::container::Appearance {
-    iced::widget::container::Appearance {
-        text_color: None,
-        background: Some(Background::Color(Color::from_rgba8(237, 243, 251, 0.88))),
-        border: Border {
-            color: Color::from_rgb8(206, 217, 232),
+            color: Color::from_rgb8(219, 228, 241),
             width: 1.0,
             radius: 12.0.into(),
         },
@@ -854,12 +1536,64 @@ fn cover_placeholder_surface(_theme: &Theme) -> iced::widget::container::Appeara
     }
 }
 
-fn cover_frame_surface(_theme: &Theme) -> iced::widget::container::Appearance {
+fn path_well_surface(_theme: &Theme) -> iced::widget::container::Appearance {
     iced::widget::container::Appearance {
         text_color: None,
-        background: Some(Background::Color(Color::from_rgb8(247, 250, 255))),
+        background: Some(Background::Color(Color::from_rgba8(241, 246, 253, 0.88))),
         border: Border {
-            color: Color::from_rgb8(209, 220, 236),
+            color: Color::from_rgb8(212, 223, 238),
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+
+fn cover_surface(_theme: &Theme) -> iced::widget::container::Appearance {
+    iced::widget::container::Appearance {
+        text_color: None,
+        background: Some(Background::Color(Color::from_rgb8(248, 252, 255))),
+        border: Border {
+            color: Color::from_rgb8(210, 222, 238),
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+
+fn cover_placeholder_surface(_theme: &Theme) -> iced::widget::container::Appearance {
+    iced::widget::container::Appearance {
+        text_color: None,
+        background: Some(Background::Color(Color::from_rgba8(238, 244, 253, 0.84))),
+        border: Border {
+            color: Color::from_rgb8(206, 219, 236),
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+
+fn confirm_surface(_theme: &Theme) -> iced::widget::container::Appearance {
+    iced::widget::container::Appearance {
+        text_color: None,
+        background: Some(Background::Color(Color::from_rgba8(252, 233, 234, 0.90))),
+        border: Border {
+            color: Color::from_rgb8(227, 166, 170),
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+
+fn plan_batch_surface(_theme: &Theme) -> iced::widget::container::Appearance {
+    iced::widget::container::Appearance {
+        text_color: None,
+        background: Some(Background::Color(Color::from_rgb8(247, 251, 255))),
+        border: Border {
+            color: Color::from_rgb8(213, 224, 240),
             width: 1.0,
             radius: 12.0.into(),
         },
@@ -885,13 +1619,6 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
-fn with_alpha(color: Color, alpha: f32) -> Color {
-    Color {
-        a: color.a * alpha.clamp(0.0, 1.0),
-        ..color
-    }
-}
-
 fn main() -> iced::Result {
     let args = UiArgs::parse();
 
@@ -900,8 +1627,8 @@ fn main() -> iced::Result {
             initial_series_dir: args.series_dir.unwrap_or_default(),
         },
         window: iced::window::Settings {
-            size: Size::new(1260.0, 840.0),
-            min_size: Some(Size::new(980.0, 700.0)),
+            size: Size::new(1280.0, 860.0),
+            min_size: Some(Size::new(1080.0, 760.0)),
             ..iced::window::Settings::default()
         },
         default_font: FONT_TEXT,
